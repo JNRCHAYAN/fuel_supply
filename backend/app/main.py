@@ -36,11 +36,15 @@ unstated. Both call sites are confined to ``_build_repository`` and
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from math import isfinite
+from typing import Any, AsyncIterator
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.router import api_router
 from app.config import Settings, get_settings
@@ -80,6 +84,47 @@ def _mount_api(app: FastAPI) -> None:
     ``test_no_double_api_prefix`` guards exactly that mistake.
     """
     app.include_router(api_router)
+
+
+def _name_non_finite(value: Any) -> Any:
+    """Recursively replace non-finite floats with their JSON names.
+
+    ``float("inf")`` has no JSON literal. Python's ``json.dumps`` emits the
+    non-standard token ``Infinity``, and Starlette's ``JSONResponse`` serialises
+    with ``allow_nan=False`` and refuses it outright.
+    """
+    if isinstance(value, float) and not isfinite(value):
+        if value != value:  # NaN is the only value not equal to itself
+            return "NaN"
+        return "Infinity" if value > 0 else "-Infinity"
+    if isinstance(value, dict):
+        return {key: _name_non_finite(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_name_non_finite(item) for item in value]
+    return value
+
+
+def _install_validation_error_handler(app: FastAPI) -> None:
+    """Answer a validation failure with 422 even when the input cannot be encoded.
+
+    FastAPI's default handler echoes the offending value back inside the 422
+    body. Because Starlette refuses to serialise a non-finite float, a request
+    carrying one — ``{"quantity_liters": 1e999}``, which Python's JSON parser
+    happily reads as ``inf`` — never reached the operator as the 422 it is: the
+    error response itself raised while being built, so the client saw a 500 with
+    no indication of which field was wrong.
+
+    The offending value is named rather than echoed, so the 422 keeps the
+    documented ``{"detail": [...]}`` list shape (the same shape the simulator
+    uses) and still says what was rejected and why.
+    """
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": _name_non_finite(jsonable_encoder(exc.errors()))},
+        )
 
 
 # --------------------------------------------------------------------------
@@ -205,6 +250,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     _mount_api(application)
+    _install_validation_error_handler(application)
     return application
 
 

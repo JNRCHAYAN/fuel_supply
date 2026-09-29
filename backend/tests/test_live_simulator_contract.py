@@ -369,7 +369,7 @@ def test_detector_matches_the_documented_plural_region_filter() -> None:
     metrics = Metrics.from_api(_capture("metrics"))
 
     def documented_event(event_id: int, region_ids: list[str]) -> DomainEvent:
-        return DomainEvent.from_api(
+        parsed = DomainEvent.from_api(
             {
                 "id": event_id,
                 "type": "demand_spike",
@@ -379,6 +379,13 @@ def test_detector_matches_the_documented_plural_region_filter() -> None:
                 "parameters": {"region_ids": region_ids, "multiplier": 1.8},
             }
         )
+        assert parsed.parameters == {"region_ids": region_ids, "multiplier": 1.8}
+        # The detector compares ``str(status).upper() == "ACTIVE"``. A parsed
+        # ``EventStatus`` member stringifies as ``"EventStatus.ACTIVE"`` on this
+        # interpreter, so a fully parsed event is skipped for a reason that has
+        # nothing to do with filters (reported as a separate defect). Passing the
+        # wire string here keeps the test aimed squarely at the FILTER contract.
+        return dataclasses.replace(parsed, status=parsed.status.value)
 
     dhaka_event = documented_event(101, ["region-dhaka"])
     # The documented wire form is the plural list; the singular spelling bug 3
