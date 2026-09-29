@@ -1,0 +1,71 @@
+# Build context exclusions for backend/Dockerfile.
+#
+# The context is backend/ (see docker-compose.yml). Everything listed here is
+# either large, irrelevant to the image, or must never reach a layer.
+#
+# The `.env` exclusion is a SECURITY control, not a size optimisation
+# (brief §18 "do not hard-code secrets" / "avoid exposing credentials";
+# CONTRACT §0.2). The backend reads DEEPSEEK_API_KEY from backend/.env. A build
+# context that includes it would copy it into a layer, and a layer is a
+# published artefact: `docker history` and `docker save` would expose the key to
+# anyone who can pull the image, even if a later layer deleted the file.
+# Keep this line.
+
+# --- secrets and local configuration ---------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials.json
+service-account*.json
+
+# --- local environment and caches ------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- runtime state ----------------------------------------------------------
+# The SQLite database and anything else written at runtime. Created inside the
+# image by the Dockerfile; never copied in. A baked-in database would ship one
+# machine's local state as another's starting point.
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+
+# --- not needed to build or run --------------------------------------------
+tests/
+loadtest/
+docs/
+.github/
+CONTRACT.md
+README.md
+*.md
+Dockerfile
+.dockerignore
+.git/
+.gitignore
+.gitattributes
+docker-compose*.yml
+Makefile
+*.http

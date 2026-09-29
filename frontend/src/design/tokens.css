@@ -1,0 +1,124 @@
+/* The only file in the codebase containing colour literals (spec 9.2).
+   Components reference semantic tokens; no raw hex appears elsewhere. */
+
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #0b1220;
+  --surface: #131c2e;
+  --surface-raised: #1a2438;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  --text: #e8edf5;
+  --text-muted: #94a3b8;
+  --text-subtle: #64748b;
+
+  --primary: #3b82f6;
+  --on-primary: #ffffff;
+  --accent: #f59e0b;
+
+  --chart-surface: #131c2e;
+  --chart-grid: rgba(255, 255, 255, 0.06);
+  --chart-axis: rgba(255, 255, 255, 0.14);
+
+  --series-diesel: #3987e5;
+  --series-petrol: #d95926;
+  --series-octane: #199e70;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --border: #dbeafe;
+  --border-strong: #bfdbfe;
+
+  --text: #0f172a;
+  --text-muted: #475569;
+  --text-subtle: #64748b;
+
+  --primary: #1e40af;
+  --on-primary: #ffffff;
+  --accent: #d97706;
+
+  --chart-surface: #ffffff;
+  --chart-grid: rgba(15, 23, 42, 0.07);
+  --chart-axis: rgba(15, 23, 42, 0.18);
+
+  --series-diesel: #2a78d6;
+  --series-petrol: #eb6834;
+  --series-octane: #1baf7a;
+}
+
+/* Status colours are theme-invariant by design (spec 9.2): a critical alert
+   must read identically in a dark control room and on a light laptop. */
+:root {
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  --radius-control: 4px;
+  --radius-panel: 6px;
+  --radius-pill: 999px;
+
+  --z-content: 0;
+  --z-sticky: 10;
+  --z-dropdown: 20;
+  --z-overlay: 40;
+  --z-modal: 100;
+  --z-toast: 1000;
+
+  --dur-hover: 150ms;
+  --dur-panel: 200ms;
+  --dur-modal-in: 250ms;
+  --dur-modal-out: 150ms;
+  --dur-route: 300ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-hover: 0ms;
+    --dur-panel: 0ms;
+    --dur-modal-in: 0ms;
+    --dur-modal-out: 0ms;
+    --dur-route: 0ms;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Fira Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Every number in this application either aligns in a column or updates
+   live, so tabular figures are the default rather than the exception. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+.mono {
+  font-family: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 2px;
+}

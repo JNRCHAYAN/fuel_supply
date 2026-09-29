@@ -1,0 +1,99 @@
+# Rendered by the nginx image's envsubst entrypoint into
+# /etc/nginx/conf.d/default.conf at container start. Only ${SIMULATOR_UPSTREAM}
+# is substituted (NGINX_ENVSUBST_FILTER=SIMULATOR_); nginx's own variables are
+# left intact.
+
+server {
+    listen 80;
+    server_name _;
+
+    # Docker's embedded DNS. Needed because the upstream below is referenced
+    # through a variable.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    # Resolving through a variable defers the lookup to request time. With a
+    # literal hostname nginx resolves once at startup and REFUSES TO START if
+    # the name is unknown — so an unreachable simulator would crashloop this
+    # container instead of letting the console render its own error state.
+    # This also picks up the simulator's new address after it restarts.
+    set $upstream ${SIMULATOR_UPSTREAM};
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Vite content-hashes everything under /assets, so these can never go stale.
+    location /assets/ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+
+    # index.html must never be cached, or a browser will keep loading the
+    # previous build's asset hashes after a redeploy.
+    location = /index.html {
+        add_header Cache-Control "no-store";
+    }
+
+    # The SPA owns every path that isn't the API. Unknown paths render the app
+    # (so deep links work) rather than 404ing.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Server-Sent Events. This block must come before /v1/ — nginx matches the
+    # longest prefix, and this one is longer.
+    #
+    # proxy_buffering off is the load-bearing line: with buffering on, nginx
+    # accumulates the stream and the browser receives nothing until the buffer
+    # fills, which for a low-rate tick stream means the live dashboard appears
+    # dead. X-Accel-Buffering is the belt-and-braces header for the same thing.
+    location /v1/stream {
+        # $request_uri must be appended explicitly: with a variable in
+        # proxy_pass nginx does not carry the original URI over automatically.
+        proxy_pass $upstream$request_uri;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Clears the client's implicit "Connection: close" so the upstream
+        # connection stays open for the life of the stream.
+        proxy_set_header Connection "";
+
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 24h;
+        proxy_send_timeout 24h;
+        add_header X-Accel-Buffering no;
+    }
+
+    # Everything else on /v1/* is proxied to the simulator. The browser is
+    # same-origin here, so this does not depend on the simulator's CORS policy.
+    #
+    # proxy_pass has no trailing path, so nginx forwards the original URI
+    # unchanged — /v1/health reaches the simulator as /v1/health.
+    #
+    # Response headers pass through untouched, which is required: the client
+    # reads X-Simulator-Stale off these responses to mark data stale.
+    location /v1/ {
+        # $request_uri carries the path and any query string unchanged, so
+        # /v1/demand-history?region=dhaka reaches the simulator verbatim.
+        proxy_pass $upstream$request_uri;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+
+        # Surfaces an unreachable simulator as 502 rather than a hung request,
+        # so the client's error path fires promptly.
+        proxy_connect_timeout 5s;
+    }
+}

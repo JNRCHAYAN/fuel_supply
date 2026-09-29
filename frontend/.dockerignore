@@ -1,0 +1,21 @@
+# Never ship a local .env into the image. frontend/.env holds
+# VITE_SIMULATOR_MODE=mock; if it reached the build it would compete with the
+# Dockerfile's build args. Process environment wins over .env files in Vite,
+# but excluding it removes the question entirely.
+.env
+.env.*
+!.env.example
+
+node_modules
+dist
+coverage
+
+# TypeScript's incremental build cache is machine-specific and would be stale
+# inside the image.
+tsconfig.tsbuildinfo
+
+.git
+.gitignore
+Dockerfile
+.dockerignore
+*.log
