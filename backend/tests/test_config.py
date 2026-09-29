@@ -46,6 +46,11 @@ DOCUMENTED_VARIABLES = (
     "API_PORT",
     "LOG_LEVEL",
     "CORS_ALLOW_ORIGINS",
+    # Stockout & shortage intelligence (CONTRACT section 7.4).
+    "STOCKOUT_HORIZON_TICKS",
+    "STOCKOUT_CRITICAL_TICKS",
+    "STOCKOUT_HIGH_TICKS",
+    "STOCKOUT_SAFETY_STOCK_FRACTION",
 )
 
 #: A real DeepSeek key has this shape. Nothing resembling one may be committed.

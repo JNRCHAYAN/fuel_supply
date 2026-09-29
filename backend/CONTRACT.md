@@ -585,6 +585,93 @@ Requirements — these are the brief's §7 Decision Intelligence and §9:
 - No recommendation may exceed `max_shipment`, exceed depot inventory, or use a
   `DISRUPTED` route. Test these explicitly.
 
+### 7.4 Stockout & shortage intelligence (A4b) — `stockout.py`
+
+```python
+class RiskLevel(str, Enum):
+    LOW = "LOW"; MEDIUM = "MEDIUM"; HIGH = "HIGH"; CRITICAL = "CRITICAL"
+
+LEVEL_ORDER: tuple[RiskLevel, ...] = (LOW, MEDIUM, HIGH, CRITICAL)   # ascending severity
+
+@dataclass(frozen=True)
+class RiskThresholds:
+    critical_ticks: float = 1.0
+    high_ticks: float = 3.0
+    safety_stock_fraction: float = 0.25
+    horizon_ticks: int = 8
+
+@dataclass(frozen=True)
+class IncomingSupply:
+    quantity: float
+    arrival_tick: int
+    allocation_id: str = ""
+    source_depot_id: str = ""
+
+@dataclass(frozen=True)
+class StockoutAssessment:
+    station_id: str
+    fuel_type: str
+    current_inventory: float
+    expected_demand: float
+    incoming_supply: float
+    projected_inventory: float
+    shortage_amount: float
+    surplus_amount: float
+    stockout_tick: int | None
+    ticks_until_stockout: float | None
+    risk: RiskLevel
+    basis: str                       # one operator-facing sentence
+    horizon_ticks: int
+    demand_method: str
+    demand_confidence: float
+    incoming_sources: tuple[IncomingSupply, ...] = ()
+    simulated: bool = True
+
+class StockoutAnalyzer:
+    def __init__(self, *, thresholds: RiskThresholds | None = None) -> None: ...
+    @property
+    def thresholds(self) -> RiskThresholds: ...
+    def assess(self, *, station_id: str, fuel_type: str,
+               current_inventory: float, forecast: Any,
+               incoming: Sequence[IncomingSupply] = (),
+               current_tick: int = 0) -> StockoutAssessment: ...
+    def assess_many(self, *, rows: Iterable[Mapping[str, Any]],
+                    current_tick: int = 0) -> list[StockoutAssessment]: ...
+```
+
+Requirements:
+- Same **purity contract** as 7.1–7.3: no simulator, database or network access, no
+  clock, no randomness, deterministic. Never raises, never returns NaN; identical
+  arguments always produce an equal result.
+- The projection is a **tick-by-tick walk**, not a closed-form subtraction:
+  `inventory_t = inventory_{t-1} + inflow_t - demand_t` for `t = 1..horizon`, where
+  `inflow_t` is the supply landing on tick `t` and `demand_t = forecast.points[t-1].liters`.
+  Summing the recurrence telescopes to
+  `projected_inventory == current_inventory + incoming_supply - expected_demand` — the
+  formula an operator can check by hand. The walk exists only to produce the
+  **timing**: the closed form cannot say *when* the crossing happens, and "when" is
+  the number an operator acts on.
+- `expected_demand` is the sum of the forecast's points over the horizon and comes
+  from `DemandForecaster`; this module **never re-derives it**. Two estimators of one
+  quantity would be two answers to one question.
+- Risk is banded by an **ordered, first-match-wins** rule. The checks run most severe
+  first, so the bands are nested and a projected stockout is never LOW:
+  - `CRITICAL` — `current_inventory <= 0`, **or** `ticks_until_stockout <= critical_ticks`
+  - `HIGH` — `ticks_until_stockout <= high_ticks`
+  - `MEDIUM` — `shortage_amount > 0`, **or** `projected_inventory < safety_stock`
+  - `LOW` — otherwise, where `safety_stock = safety_stock_fraction x expected_demand`
+- Only **in-transit allocations** count as a station's incoming supply (status
+  `PENDING` or `IN_TRANSIT`). Depot-directed `SupplyArrival` rows are **deliberately
+  excluded**: a delivery to a depot is not inbound to a station until somebody
+  dispatches it, and counting it would report a station as covered while nothing is
+  moving.
+- An arrival **beyond the horizon is excluded**, never folded into the end state: it
+  cannot prevent a stockout that happens before it lands, and counting it would
+  report a dry station as covered.
+- Configuration is read from `Settings` (`app/config.py`) and passed in as
+  `RiskThresholds`: `STOCKOUT_HORIZON_TICKS` (8), `STOCKOUT_CRITICAL_TICKS` (1.0),
+  `STOCKOUT_HIGH_TICKS` (3.0), `STOCKOUT_SAFETY_STOCK_FRACTION` (0.25).
+
 ---
 
 ## 8. LLM / DeepSeek — `app/llm/` (A7)
@@ -673,6 +760,7 @@ contains a prediction, recommendation, or explanation.
 | GET | `/api/v1/network/snapshot` | Instance + depots + stations + routes + regions |
 | GET | `/api/v1/network/demand-history` | Proxied, validated |
 | GET | `/api/v1/forecast` | Forecast + stockout risk per station/fuel |
+| GET | `/api/v1/stockout` | Stockout + shortage projection per station/fuel, with risk bands |
 | GET | `/api/v1/risk` | Current `RiskSignal`s (brief §6 "shortage alerts") |
 | GET | `/api/v1/recommendations` | Ranked, inspectable recommendations |
 | GET | `/api/v1/recommendations/{id}/explanation` | LLM or fallback explanation |

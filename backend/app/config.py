@@ -85,6 +85,35 @@ class Settings(BaseSettings):
     # console outside the compose network.
     cors_allow_origins: str = "http://localhost:8080,http://localhost:5173"
 
+    # --- stockout / shortage intelligence (CONTRACT section 7.4) ----------
+    # These four feed ``RiskThresholds`` in ``app.intelligence.stockout``. They
+    # are settings rather than constants because the right band depends on the
+    # network being watched: a dense city grid tolerates far less warning than a
+    # long rural haul, and the console reads the same either way.
+    #
+    # How many simulated ticks ahead the inventory projection runs. A tick is
+    # fifteen simulated minutes, so the default is two simulated hours -- long
+    # enough for a depot-to-station run to land inside the window, short enough
+    # that the demand forecast is still shaped by observed history rather than
+    # by the flat tail a long horizon decays into.
+    stockout_horizon_ticks: int = 8
+    # Ticks-to-stockout at or below which risk is CRITICAL. One tick or less
+    # means the station is dry now or dry before the next tick, so no
+    # reallocation can reach it in time; CRITICAL is therefore reserved for
+    # "act on the next delivery, not this one". A gentler bound would let a
+    # station that is already dry read as merely HIGH.
+    stockout_critical_ticks: float = 1.0
+    # Ticks-to-stockout at or below which risk is HIGH. Three ticks is under an
+    # hour of simulated time: still actionable, but only if the operator acts on
+    # this reading rather than the next one.
+    stockout_high_ticks: float = 3.0
+    # Safety stock as a fraction of the horizon's expected demand. Below it, and
+    # with no stockout projected inside the horizon, risk is MEDIUM: the station
+    # is not going dry, but it has no cushion left, so the next demand spike or
+    # missed delivery would take it there. A quarter of the horizon's demand is
+    # the smallest buffer that still absorbs one ordinary bad day.
+    stockout_safety_stock_fraction: float = 0.25
+
     @property
     def llm_available(self) -> bool:
         """True only when the LLM is enabled *and* a key is actually present.

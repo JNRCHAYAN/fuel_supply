@@ -5,6 +5,7 @@ import { DataTable, type Column } from '../components/DataTable'
 import { ThemeProvider, useTheme } from '../design/theme'
 import { FUEL_TYPES, type Depot, type Station } from '../lib/types/simulator'
 import { useDashboard } from '../features/dashboard/useDashboard'
+import { StockoutPanel } from '../features/stockout/StockoutPanel'
 
 const number = (value: number) => value.toLocaleString('en-US', { maximumFractionDigits: 0 })
 
@@ -29,7 +30,7 @@ function Dashboard() {
     <aside className="sidebar">
       <a className="brand" href="#overview"><span className="brand-mark">F</span><span>FUEL OPS<small>INTELLIGENCE PLATFORM</small></span></a>
       <div className="sidebar-label">WORKSPACE</div>
-      <nav aria-label="Dashboard sections"><a className="selected" href="#overview">Overview <span>01</span></a><a href="#inventory">Network inventory</a><a href="#supply">Incoming supply</a><a href="#health">Service health</a></nav>
+      <nav aria-label="Dashboard sections"><a className="selected" href="#overview">Overview <span>01</span></a><a href="#inventory">Network inventory</a><a href="#supply">Incoming supply</a><a href="#stockout">Stockout risk</a><a href="#health">Service health</a></nav>
       <div className="sidebar-note"><span className="state-label">SIMULATED NETWORK</span><p>Bangladesh fuel operations<br />BUP CSE Fest 2026</p><p>Feature 1 · Operations dashboard</p></div>
     </aside>
     <div className="workspace">
@@ -62,6 +63,7 @@ function Dashboard() {
             <Panel title="Network disruptions" stale={stale}><p className="text-xs text-muted mb-3">All regions · active simulator events</p>{snapshot.events.filter(item => item.status === 'ACTIVE').length ? snapshot.events.filter(item => item.status === 'ACTIVE').map(item => <div className="event-row" key={item.id}><strong>{item.type.replaceAll('_', ' ')}</strong><span>Ticks {item.start_tick}–{item.end_tick}</span></div>) : <p className="text-muted py-6">No active disruptions reported</p>}</Panel>
           </div>
         </>}
+        <div id="stockout"><StockoutPanel /></div>
         <section id="health" className="health-section"><h2>Service health</h2>{healthError ? <p className="text-status-warning" role="status">Service health unavailable. Retrying automatically.</p> : health ? <div className="health-grid">{Object.entries(health.components).map(([name, component]) => <div className="health-item" key={name}><div><strong>{name.replaceAll('_', ' ')}</strong><span className={`state-label ${component.status === 'ok' ? 'state-good' : 'state-warning'}`}>{component.status}</span></div><p>{component.detail ?? 'No additional detail'}</p></div>)}</div> : <p className="text-muted">Checking services…</p>}</section>
         <footer>All values represent the supplied BUP simulator. No real fuel infrastructure is connected.</footer>
       </main>

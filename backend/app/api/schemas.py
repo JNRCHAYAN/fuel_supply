@@ -528,6 +528,51 @@ def get_forecaster(request: Request) -> Any:
     return _cached(request, "_api_forecaster", _build)
 
 
+def get_stockout_analyzer(request: Request) -> Any:
+    """The `StockoutAnalyzer` (CONTRACT.md 7.4), configured from `Settings`.
+
+    Thresholds are read off A1's `Settings` one key at a time and only when the
+    setting is present, so a config that predates section 7.4 still yields a
+    working analyser on the engine's own defaults rather than a 500.
+    """
+    found, value = _from_deps(("get_stockout_analyzer", "get_stockout"), request)
+    if found:
+        return value
+    found, value = _from_state(request, ("stockout_analyzer", "analyzer"))
+    if found:
+        return value
+
+    def _build() -> Any:
+        cls = _import_attr("app.intelligence.stockout", ("StockoutAnalyzer",))
+        thresholds_cls = _import_attr("app.intelligence.stockout", ("RiskThresholds",))
+        if cls is None or thresholds_cls is None:
+            raise dependency_unavailable("StockoutAnalyzer")
+        settings = None
+        try:
+            settings = get_settings()
+        except HTTPException:
+            settings = None
+        thresholds = None
+        if settings is not None:
+            values = {
+                target: getattr(settings, source)
+                for source, target in (
+                    ("stockout_critical_ticks", "critical_ticks"),
+                    ("stockout_high_ticks", "high_ticks"),
+                    ("stockout_safety_stock_fraction", "safety_stock_fraction"),
+                    ("stockout_horizon_ticks", "horizon_ticks"),
+                )
+                if getattr(settings, source, None) is not None
+            }
+            thresholds = thresholds_cls(**values) if values else thresholds_cls()
+        try:
+            return cls(thresholds=thresholds) if thresholds is not None else cls()
+        except TypeError:
+            return cls()
+
+    return _cached(request, "_api_stockout_analyzer", _build)
+
+
 def get_detector(request: Request) -> Any:
     """A5's `AnomalyDetector` (CONTRACT.md section 7.2)."""
     found, value = _from_deps(("get_detector", "get_anomaly_detector"), request)
@@ -717,6 +762,72 @@ class ForecastResponse(BaseModel):
     generated_at_tick: int | None = None
     count: int = 0
     forecasts: list[StationForecastOut] = Field(default_factory=list)
+    simulated: bool = True
+    model_config = _ALLOW_EXTRA
+
+
+class StockoutThresholdsOut(BaseModel):
+    """The bands the projection was judged against, echoed for the console.
+
+    Returned alongside the assessments so a CRITICAL badge can be read without
+    guessing which thresholds produced it; the values are the ones the engine
+    actually ran with, not the schema defaults.
+    """
+
+    critical_ticks: float = 1.0
+    high_ticks: float = 3.0
+    safety_stock_fraction: float = 0.25
+    horizon_ticks: int = 8
+    model_config = _ALLOW_EXTRA
+
+
+class IncomingSupplyOut(BaseModel):
+    """One consignment already on its way to the station (in-transit only)."""
+
+    quantity: float = 0.0
+    arrival_tick: int = 0
+    allocation_id: str = ""
+    source_depot_id: str = ""
+    model_config = _ALLOW_EXTRA
+
+
+class StockoutAssessmentOut(BaseModel):
+    """One (station, fuel) projection — every term of the arithmetic present.
+
+    The point of exposing `current_inventory`, `expected_demand` and
+    `incoming_supply` next to `projected_inventory` is that the conclusion can be
+    checked by hand rather than trusted: they reconcile exactly.
+    """
+
+    station_id: str = ""
+    fuel_type: str = ""
+    current_inventory: float = 0.0
+    expected_demand: float = 0.0
+    incoming_supply: float = 0.0
+    projected_inventory: float = 0.0
+    shortage_amount: float = 0.0
+    surplus_amount: float = 0.0
+    stockout_tick: int | None = None
+    ticks_until_stockout: float | None = None
+    risk: str = "LOW"
+    basis: str = ""
+    horizon_ticks: int = 0
+    demand_method: str = "unknown"
+    demand_confidence: float = 0.0
+    incoming_sources: list[IncomingSupplyOut] = Field(default_factory=list)
+    simulated: bool = True
+    model_config = _ALLOW_EXTRA
+
+
+class StockoutResponse(BaseModel):
+    """`GET /api/v1/stockout` — the projection envelope (CONTRACT.md 7.4)."""
+
+    horizon_ticks: int = 0
+    generated_at_tick: int | None = None
+    count: int = 0
+    thresholds: StockoutThresholdsOut = Field(default_factory=StockoutThresholdsOut)
+    summary: dict[str, int] = Field(default_factory=dict)
+    assessments: list[StockoutAssessmentOut] = Field(default_factory=list)
     simulated: bool = True
     model_config = _ALLOW_EXTRA
 

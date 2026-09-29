@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import inspect
 import math
+from dataclasses import replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import APIRouter, Body, Depends, Query
@@ -30,12 +31,16 @@ from app.api.schemas import (
     ExplanationResponse,
     ForecastPointOut,
     ForecastResponse,
+    IncomingSupplyOut,
     RecommendationOut,
     RecommendationsResponse,
     RiskResponse,
     RiskSignalOut,
     StationForecastOut,
+    StockoutAssessmentOut,
+    StockoutResponse,
     StockoutRiskOut,
+    StockoutThresholdsOut,
     SubmitRequest,
     SubmitResponse,
     api_error,
@@ -49,10 +54,12 @@ from app.api.schemas import (
     get_metrics,
     get_repository,
     get_simulator_client,
+    get_stockout_analyzer,
     record_failure,
     simulator_guard,
     to_jsonable,
 )
+from app.intelligence.stockout import LEVEL_ORDER, IncomingSupply, StockoutAnalyzer
 
 logger = get_logger(__name__)
 
@@ -631,6 +638,116 @@ async def _find_recommendation(
 
 
 # ---------------------------------------------------------------------------
+# Stockout projection (CONTRACT.md 7.4)
+# ---------------------------------------------------------------------------
+
+
+#: An allocation in one of these states has not landed yet, so it is genuinely
+#: inbound. `ARRIVED` is already inside the station's inventory and a
+#: `FAILED`/`CANCELLED` consignment will never arrive; counting either as
+#: incoming supply would report a station as covered when nothing is moving.
+_INCOMING_STATUSES = frozenset({"PENDING", "IN_TRANSIT"})
+
+
+def _risk_key(level: Any) -> str:
+    """The wire spelling of a risk band, given either the enum or a string.
+
+    ``RiskLevel`` is a ``str``-mixin enum, but ``str(level)`` is *not* reliably
+    its value across Python versions, so the value is unwrapped explicitly.
+    """
+    value = getattr(level, "value", level)
+    return str(value or "").upper()
+
+
+def _allocation_quantity(value: Any) -> float:
+    """A consignment size, coerced to a finite, non-negative quantity."""
+    try:
+        quantity = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, quantity) if math.isfinite(quantity) else 0.0
+
+
+def _incoming_by_key(
+    allocations: Sequence[Any], current_tick: int
+) -> dict[tuple[str, str], list[IncomingSupply]]:
+    """`(station_id, FUEL) -> [IncomingSupply]` from the in-transit ledger.
+
+    The ledger is the only observed evidence that something is on its way *to a
+    station*, so it is read once and indexed here rather than queried per
+    (station, fuel) pair. Rows are read through ``to_jsonable`` so a dataclass
+    and a wire mapping are handled identically.
+
+    ``arrival_tick`` is stored as an **offset** from ``current_tick``: the
+    engine's horizon is relative to now, and a consignment that is already due
+    or past (offset < 1) is dropped rather than folded into the first tick --
+    inventory that has not actually landed must not be counted as if it had.
+    """
+    by_key: dict[tuple[str, str], list[IncomingSupply]] = {}
+    for row in allocations or ():
+        data = to_jsonable(row)
+        if not isinstance(data, Mapping):
+            continue
+        station_id = data.get("destination_station_id")
+        if not station_id:
+            continue
+        if str(data.get("status") or "").upper() not in _INCOMING_STATUSES:
+            continue
+        arrival = data.get("expected_arrival_tick")
+        if arrival is None:
+            arrival = data.get("departure_tick")
+        if arrival is None:
+            continue
+        try:
+            offset = int(arrival) - int(current_tick)
+        except (TypeError, ValueError):
+            continue
+        if offset < 1:
+            continue
+        fuel_type = str(data.get("fuel_type") or "").upper()
+        if not fuel_type:
+            continue
+        by_key.setdefault((str(station_id), fuel_type), []).append(
+            IncomingSupply(
+                quantity=_allocation_quantity(data.get("quantity")),
+                arrival_tick=offset,
+                allocation_id=str(data.get("id") or ""),
+                source_depot_id=str(data.get("source_depot_id") or ""),
+            )
+        )
+    return by_key
+
+
+def _to_assessment_out(assessment: Any) -> StockoutAssessmentOut | None:
+    """Project one engine assessment onto its response model.
+
+    ``to_jsonable`` unwraps the frozen dataclass and, in doing so, renders the
+    ``RiskLevel`` as its ``.value`` -- so the band reaches the console as
+    ``"CRITICAL"``, never as ``"RiskLevel.CRITICAL"``.
+
+    A payload that cannot be projected returns ``None`` and the caller drops
+    that row: one unreadable assessment must never blank the whole page, and a
+    single malformed incoming source is dropped from a row rather than taking
+    the row with it.
+    """
+    payload = to_jsonable(assessment)
+    if not isinstance(payload, Mapping):
+        return None
+    incoming: list[IncomingSupplyOut] = []
+    for source in payload.get("incoming_sources") or ():
+        if not isinstance(source, Mapping):
+            continue
+        try:
+            incoming.append(IncomingSupplyOut(**dict(source)))
+        except Exception:  # noqa: BLE001 - drop the source, keep the row
+            continue
+    try:
+        return StockoutAssessmentOut(**{**dict(payload), "incoming_sources": incoming})
+    except Exception:  # noqa: BLE001 - never let one row blank the page
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -679,6 +796,197 @@ async def forecast(
         generated_at_tick=_snapshot_tick(snapshot),
         count=len(rows),
         forecasts=rows,
+        simulated=True,
+    )
+
+
+@router.get(
+    "/api/v1/stockout",
+    response_model=StockoutResponse,
+    summary="Stockout and shortage intelligence",
+)
+async def stockout(
+    station_id: str | None = Query(default=None, max_length=100),
+    fuel_type: str | None = Query(default=None, max_length=20),
+    risk: str | None = Query(default=None, max_length=20),
+    horizon_ticks: int = Query(default=8, ge=1, le=72),
+    client: Any = Depends(get_simulator_client),
+    repository: Any = Depends(get_repository),
+    forecaster: Any = Depends(get_forecaster),
+    analyzer: Any = Depends(get_stockout_analyzer),
+    metrics: Any = Depends(get_metrics),
+) -> StockoutResponse:
+    """Project every (station, fuel) pair to the end of the horizon.
+
+    Composed exactly like `/forecast` — `load_snapshot` → `build_history` →
+    `compute_forecasts` — with one addition: the in-transit allocation ledger,
+    which is the only observed evidence that something is actually on its way to
+    a station. Demand still comes from A4's forecaster, so the two routes can
+    never disagree about consumption; what this route adds is the other half of
+    the ledger, and the tick on which the balance crosses zero.
+
+    **Incoming supply.** One `get_allocations` read is shared by every row; it is
+    never fetched per station, because the ledger is a single upstream call and
+    querying it per pair would turn one page into an N+1 storm. Only `PENDING`
+    and `IN_TRANSIT` allocations qualify. An `ARRIVED` one is already counted in
+    the station's `inventory` block, and a `FAILED`/`CANCELLED` one will never
+    land, so treating either as inbound would double-count the first and
+    over-promise on the second. The arrival tick is `expected_arrival_tick`, or
+    `departure_tick` when no estimate was published, and is stored on the
+    `IncomingSupply` as an **offset** from the snapshot's current tick, because
+    the engine's horizon is relative; an allocation already due or past
+    (offset < 1) is dropped rather than folded into the first tick. Fuel-type
+    matching is case-insensitive. Depot-directed `supply_arrivals` are
+    deliberately not attributed to stations: a delivery to a depot is not inbound
+    to a station until somebody dispatches it, and pretending otherwise would
+    report a station as covered while nothing is moving.
+
+    A ledger that cannot be read degrades to "no known inbound supply", logged
+    through `record_failure(event="allocations_unavailable")` exactly as a
+    missing demand history is, rather than failing the page. The projection is
+    then pessimistic, which is the honest direction to be wrong in: it reports a
+    shortage the operator can still act on.
+
+    **Summary and filters.** `summary` counts every level of `LEVEL_ORDER`,
+    including the zeros, so the console can render four tiles without a missing
+    key silently defaulting to 0 — "no CRITICAL rows" is then a stated fact
+    rather than an absent key. The counts describe the **station/fuel scope**,
+    not the risk-filtered view: `risk=HIGH` narrows `assessments`, while
+    `summary` still reports how that whole scope is banded. Tiles that collapsed
+    to "4 CRITICAL, 0, 0, 0" the moment a filter was applied would say nothing
+    about the network and everything about the query; narrowing the tiles to the
+    active filter is the console's job, and it can do it from `assessments`.
+
+    An unknown `station_id` is the same typed 404 `/forecast` raises, checked
+    against the ids present in the snapshot rather than against the result rows,
+    so a station that exists but whose forecast was filtered away is reported as
+    an empty result, never as a station that does not exist.
+    """
+    if analyzer is None:
+        raise dependency_unavailable("StockoutAnalyzer")
+
+    # A per-request horizon has to reach the engine, not just the forecaster.
+    # The bands are what every row is judged against, so echoing the query
+    # parameter in the envelope while the engine still ran the configured
+    # horizon would report one number and compute another -- and the surplus
+    # rows past the requested horizon would be judged against a longer window
+    # than the caller asked for. Rebuilt only when the two actually differ, so
+    # the ordinary request keeps using the injected, cached analyzer.
+    configured_horizon = getattr(getattr(analyzer, "thresholds", None), "horizon_ticks", None)
+    if configured_horizon != horizon_ticks:
+        try:
+            analyzer = StockoutAnalyzer(
+                thresholds=replace(analyzer.thresholds, horizon_ticks=horizon_ticks)
+            )
+        except Exception:  # noqa: BLE001 - a peer analyzer must not fail the page
+            pass
+
+    snapshot = await load_snapshot(client, metrics=metrics)
+    history = await build_history(snapshot, client, repository, metrics=metrics)
+    computed = await compute_forecasts(
+        snapshot, history, forecaster, horizon_ticks=horizon_ticks
+    )
+
+    tick = _snapshot_tick(snapshot) or 0
+    stations = _station_index(snapshot)
+
+    # One ledger read for the whole page. A missing one is not fatal: the page
+    # still answers, with every station's inbound supply unknown rather than
+    # absent, which is why it is logged rather than swallowed.
+    allocations: Sequence[Any] = ()
+    try:
+        allocations = (
+            await asyncio.wait_for(_call(client.get_allocations), timeout=15.0)
+        ) or ()
+    except Exception as exc:  # noqa: BLE001 - an absent ledger must not fail the page
+        record_failure(
+            logger,
+            metrics,
+            event="allocations_unavailable",
+            code="simulator_error",
+            detail={"exc": type(exc).__name__},
+        )
+        allocations = ()
+    incoming_by_key = _incoming_by_key(allocations, tick)
+
+    # Every (station, fuel) the forecaster knows about gets a projection, with
+    # on-hand stock read from the snapshot and 0.0 when the fuel is not carried
+    # -- a station that stocks no DIESEL is dry of DIESEL, not unknown.
+    rows: list[dict[str, Any]] = []
+    for key, forecast in computed.forecasts.items():
+        inventory = to_jsonable(getattr(stations.get(key[0]), "inventory", {})) or {}
+        liters = inventory.get(key[1]) if isinstance(inventory, Mapping) else None
+        rows.append(
+            {
+                "station_id": key[0],
+                "fuel_type": key[1],
+                "current_inventory": (
+                    float(liters)
+                    if isinstance(liters, (int, float)) and not isinstance(liters, bool)
+                    else 0.0
+                ),
+                "forecast": forecast,
+                "incoming": incoming_by_key.get((key[0], str(key[1]).upper()), []),
+            }
+        )
+
+    engine_rows = await _call(analyzer.assess_many, rows=rows, current_tick=tick) or []
+
+    if station_id and station_id not in stations:
+        raise api_error(
+            404,
+            "station_not_found",
+            f"no station '{station_id}' in the current snapshot",
+            details={"station_id": station_id},
+        )
+
+    requested_fuel = fuel_type.upper() if fuel_type else None
+    requested_risk = risk.upper() if risk else None
+
+    # The station/fuel scope. `summary` is counted from *this* list, so a risk
+    # filter narrows the rows below without shrinking the picture above them.
+    scoped = [
+        assessment
+        for assessment in engine_rows
+        if (not station_id or getattr(assessment, "station_id", None) == station_id)
+        and (
+            not requested_fuel
+            or str(getattr(assessment, "fuel_type", "")).upper() == requested_fuel
+        )
+    ]
+
+    summary: dict[str, int] = {level.value: 0 for level in LEVEL_ORDER}
+    for assessment in scoped:
+        level = _risk_key(getattr(assessment, "risk", None))
+        summary[level] = summary.get(level, 0) + 1
+
+    visible = [
+        assessment
+        for assessment in scoped
+        if not requested_risk
+        or _risk_key(getattr(assessment, "risk", None)) == requested_risk
+    ]
+    assessments = [
+        out
+        for out in (_to_assessment_out(assessment) for assessment in visible)
+        if out is not None
+    ]
+
+    thresholds_payload = to_jsonable(getattr(analyzer, "thresholds", None)) or {}
+    if not isinstance(thresholds_payload, Mapping):
+        thresholds_payload = {}
+    try:
+        thresholds = StockoutThresholdsOut(**dict(thresholds_payload))
+    except Exception:  # noqa: BLE001 - echo the schema defaults rather than 500
+        thresholds = StockoutThresholdsOut()
+
+    return StockoutResponse(
+        horizon_ticks=horizon_ticks,
+        generated_at_tick=tick,
+        count=len(assessments),
+        thresholds=thresholds,
+        summary=summary,
+        assessments=assessments,
         simulated=True,
     )
 

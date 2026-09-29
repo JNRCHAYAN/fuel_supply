@@ -26,6 +26,9 @@ CONTRACT_ROUTES: set[tuple[str, str]] = {
     ("GET", "/api/v1/network/snapshot"),
     ("GET", "/api/v1/network/demand-history"),
     ("GET", "/api/v1/forecast"),
+    # Stockout & shortage intelligence (CONTRACT section 7.4). A read-only
+    # projection alongside /forecast, which it deliberately does not alter.
+    ("GET", "/api/v1/stockout"),
     ("GET", "/api/v1/risk"),
     ("GET", "/api/v1/recommendations"),
     ("GET", "/api/v1/recommendations/{id}/explanation"),

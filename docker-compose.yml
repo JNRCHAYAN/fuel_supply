@@ -70,6 +70,15 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       LLM_ENABLED: ${LLM_ENABLED:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Stockout risk bands (CONTRACT §7.4). Forwarded explicitly because
+      # .dockerignore keeps .env out of the build context, so the container
+      # never reads it: anything not listed here exists only as the default in
+      # config.py, and setting it in the root .env would silently do nothing.
+      # The defaults below are the documented ones, repeated for that reason.
+      STOCKOUT_HORIZON_TICKS: ${STOCKOUT_HORIZON_TICKS:-8}
+      STOCKOUT_CRITICAL_TICKS: ${STOCKOUT_CRITICAL_TICKS:-1.0}
+      STOCKOUT_HIGH_TICKS: ${STOCKOUT_HIGH_TICKS:-3.0}
+      STOCKOUT_SAFETY_STOCK_FRACTION: ${STOCKOUT_SAFETY_STOCK_FRACTION:-0.25}
     ports:
       # Published so the operator API can be exercised directly with curl, and
       # so /docs (Swagger UI) is reachable during judging.
