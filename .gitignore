@@ -57,6 +57,14 @@ backend/data/
 # Claude Code worktrees
 .claude/worktrees/
 
+# Throwaway scratch/benchmark scripts and stray notes.
+# A capacity-probe script (backend/probe_sim.py) and a stray "New Text
+# Document.txt" were once committed; both have been removed. These rules keep
+# the next scratch file from being committed by accident. See docs/hygiene.md.
+probe_*.py
+bench_*.py
+scratch/
+
 # Misc
 *.tsbuildinfo
 .cache/

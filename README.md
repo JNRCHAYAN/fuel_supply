@@ -42,7 +42,7 @@ This starts **three** containers and wires them together:
 
 | Service | Container | Published on | Purpose |
 | --- | --- | --- | --- |
-| `simulator-api` | `fuel-simulator-api` | `8000` | The published BUP simulator image, unmodified |
+| `simulator-api` | `fuel-simulator-api` | `${SIMULATOR_HOST_PORT}` (default `8000`) | The published BUP simulator image, unmodified |
 | `backend` | `fuel-supply-backend` | `9000` | The FastAPI intelligence service |
 | `frontend` | `fuel-supply-frontend` | `8080` | The operator console, served by nginx |
 
@@ -54,8 +54,15 @@ Once it is up:
 | Backend API — Swagger UI | <http://localhost:9000/docs> |
 | Backend metrics (Prometheus exposition) | <http://localhost:9000/metrics> |
 | Backend component status | <http://localhost:9000/api/v1/status> |
-| Simulator's own dashboard | <http://localhost:8000/admin> |
-| Simulator's own Swagger UI | <http://localhost:8000/docs> |
+| Simulator's own dashboard | `http://localhost:<SIMULATOR_HOST_PORT>/admin` |
+| Simulator's own Swagger UI | `http://localhost:<SIMULATOR_HOST_PORT>/docs` |
+
+The simulator's host port is the `SIMULATOR_HOST_PORT` variable (`8000` by
+default, per `docker-compose.yml` and `.env.example`). The `.env` in this
+checkout sets it to `8001`, so on this deployment the last two rows are
+<http://localhost:8001/admin> and <http://localhost:8001/docs>. Only those two
+direct-to-simulator URLs move with the port — the console and the backend both
+reach the simulator over the Compose network, so their URLs are unaffected.
 
 To stop everything:
 
@@ -115,16 +122,19 @@ Prometheus metrics at `/metrics`.
 **The simulator's host port matters in this mode.** The committed default for
 `SIMULATOR_BASE_URL` is `http://simulator-api:8000`, which is the Compose
 service name and does **not** resolve on the host. Running directly, the backend
-reaches the simulator over the host network, so point it at whichever host port
-the simulator is published on — for example, if you started the stack with
-`SIMULATOR_HOST_PORT=8001`, set:
+reaches the simulator over the host network, so it must be pointed at the host
+port the simulator container is actually published on. On this deployment that
+port is **`8001`** (the root `.env` sets `SIMULATOR_HOST_PORT=8001`), so set:
 
 ```
 SIMULATOR_BASE_URL=http://localhost:8001
 ```
 
-in `backend/.env`. Reaching the simulator over the Compose network from a
-directly-run backend is not possible; only the published host port is.
+in `backend/.env`. If your simulator is published on a different port — check
+`SIMULATOR_HOST_PORT` in the root `.env`, or `docker compose port
+simulator-api 8000` — use that port here instead. Reaching the simulator over
+the Compose network from a directly-run backend is not possible; only the
+published host port is.
 
 A note on what "running" means here: the backend boots even when the simulator
 and the database are both unreachable. A failed `Repository.init()` or
@@ -196,6 +206,7 @@ boots with none of them set.
 | `SIMULATOR_MAX_RETRIES` | `3` | Retries on 5xx and transport errors only — never on a 4xx, which is not a transient failure. |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive failures tolerated before the circuit breaker opens. |
 | `CIRCUIT_RESET_SECONDS` | `30` | How long the breaker stays open before a single half-open trial. |
+| `SIMULATOR_CACHE_TTL_SECONDS` | `1` | How long a successful simulator read is reused, and the window concurrent callers share one in-flight fetch. A load guard against the simulator's connection pool, not an optimisation. |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/fuel.db` | SQLAlchemy async URL. SQLite needs no infrastructure; the scheme can be swapped for Postgres without touching code. |
 | `DEEPSEEK_API_KEY` | *(empty)* | The one secret. |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek's OpenAI-compatible API root; the client appends `/chat/completions`. |

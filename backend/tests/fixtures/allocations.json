@@ -1,0 +1,1 @@
+[{"id":1,"idempotency_key":"smoke-verify-001","source_depot_id":"depot-gazipur","destination_station_id":"station-mirpur","route_id":"route-gazipur-mirpur","fuel_type":"DIESEL","quantity":5000.0,"created_tick":480,"departure_tick":480,"expected_arrival_tick":482,"actual_arrival_tick":482,"status":"ARRIVED","failure_reason":null}]

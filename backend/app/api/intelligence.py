@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import math
 from typing import Any, Iterable, Mapping, Sequence
 
 from fastapi import APIRouter, Body, Depends, Query
@@ -409,6 +410,21 @@ def _engine_policy(engine: Any) -> str | None:
 def _snapshot_tick(snapshot: Any) -> int | None:
     tick = getattr(snapshot, "tick", None)
     return int(tick) if isinstance(tick, (int, float)) else None
+
+
+def _is_positive_finite(value: Any) -> bool:
+    """True for a real, positive, finite number.
+
+    ``bool`` is excluded deliberately: ``True`` is an ``int`` in Python and
+    ``True > 0``, so without this a recommendation carrying ``quantity: true``
+    would dispatch one litre.
+    """
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
 
 
 def _derive_idempotency_key(
@@ -824,13 +840,16 @@ async def submit_recommendation(
         if body.quantity_liters is not None
         else payload.get("quantity_liters")
     )
-    if body.quantity_liters is not None and not body.quantity_liters > 0:
-        raise api_error(
-            400,
-            "invalid_quantity",
-            "quantity_liters must be greater than zero",
-            details={"quantity_liters": body.quantity_liters},
-        )
+    # The operator's own `quantity_liters` is already bounded by the request
+    # schema, so this guards the *other* source: the size the allocation engine
+    # put on the recommendation, which never passes through a request model at
+    # all. Without it a non-finite size is serialised as the non-standard JSON
+    # literal `Infinity` and comes back from the simulator as a parse error that
+    # tells the operator nothing about their own recommendation. Normalising to
+    # `None` here funnels it into the same `recommendation_incomplete` list as a
+    # recommendation that simply omits the size.
+    if not _is_positive_finite(quantity):
+        quantity = None
 
     # A2's `AllocationRequest.idempotency_key` is required by the simulator, so
     # one is always sent when the operator does not supply their own.
@@ -864,9 +883,7 @@ async def submit_recommendation(
         "quantity": float(quantity) if quantity is not None else None,
     }
     missing = sorted(
-        key
-        for key, value in request_payload.items()
-        if value in (None, "") or (key == "quantity" and not value > 0)
+        key for key, value in request_payload.items() if value in (None, "")
     )
     if missing:
         raise api_error(

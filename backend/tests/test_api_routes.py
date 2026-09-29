@@ -40,6 +40,16 @@ CONTRACT_ROUTES: set[tuple[str, str]] = {
     ("GET", "/api/v1/admin/faults"),
     ("POST", "/api/v1/admin/faults"),
     ("POST", "/api/v1/admin/simulation/{action}"),
+    # The admin workstream exposed the remaining guide section 7 control routes
+    # (audit log, event timeline, RUNNING<->PAUSED toggle, fault clear). The
+    # CONTRACT.md section 9 table predates guide section 7, so the table below is
+    # the current truth; registering them here is what keeps this test's
+    # "no undeclared route" guard meaningful.
+    ("GET", "/api/v1/admin/audit"),
+    ("GET", "/api/v1/admin/events"),
+    ("POST", "/api/v1/admin/events"),
+    ("POST", "/api/v1/admin/toggle"),
+    ("POST", "/api/v1/admin/faults/clear"),
     # Exposed by the network workstream from the simulator's own sub-resource
     # reads (guide sections 4.5/4.6). They are in the router, so they belong in
     # this table; it is the guard against a route appearing undeclared.
@@ -153,12 +163,16 @@ def test_response_models_are_declared_for_the_data_routes() -> None:
     assert not undocumented, f"routes without a response_model: {sorted(undocumented)}"
 
 
-def test_admin_clear_faults_has_no_route() -> None:
-    """`admin_clear_faults` exists in section 5.4 but has no row in section 9.
+def test_admin_clear_faults_is_now_exposed() -> None:
+    """`admin_clear_faults` had no row in the CONTRACT.md section 9 table.
 
-    Recorded as a test so the gap is visible rather than silently invented.
+    This was recorded as a gap; the admin workstream has since exposed it from
+    guide section 7.11, so the gap is closed and the route is a declared row in
+    `CONTRACT_ROUTES` above. The test now pins that it stays there rather than
+    reappearing as an undeclared route.
     """
-    assert "/api/v1/admin/faults/clear" not in {r.path for r in api_router.routes}
+    assert "/api/v1/admin/faults/clear" in {r.path for r in api_router.routes}
+    assert ("POST", "/api/v1/admin/faults/clear") in CONTRACT_ROUTES
 
 
 # ---------------------------------------------------------------------------

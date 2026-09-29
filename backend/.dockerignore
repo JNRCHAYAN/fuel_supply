@@ -69,3 +69,11 @@ Dockerfile
 docker-compose*.yml
 Makefile
 *.http
+
+# --- scratch / throwaway -----------------------------------------------------
+# A tracked capacity-probe script (backend/probe_sim.py) was removed from the
+# repository; no scratch or benchmark file belongs in a build context either.
+# See docs/hygiene.md.
+probe_*.py
+bench_*.py
+scratch/

@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 import test_api_support  # noqa: F401
-from test_api_support import FakeSimulatorClient, build_app, client
+from test_api_support import FakeSimulatorClient, build_app, client, fake_settings
 
 from app.api.health import _breaker_state, _read_is_stale
 
@@ -202,7 +202,15 @@ def test_a_memo_hit_within_the_window_is_not_stale() -> None:
 
 
 def test_closed_breaker_with_a_fresh_reading_still_reports_healthy() -> None:
-    body = client(build_app(client=FakeSimulatorClient(breaker_state="closed"))).get(STATUS).json()
+    app = build_app(
+        client=FakeSimulatorClient(breaker_state="closed"),
+        # The default fixture runs without an LLM key, and a missing key is a
+        # `degraded` component by contract -- configure one so that the
+        # top-level verdict is decided by the simulator under test.
+        settings=fake_settings(llm_available=True),
+        llm_client=SimpleNamespace(available=True),
+    )
+    body = client(app).get(STATUS).json()
     simulator = _simulator(body)
     assert simulator["status"] == "ok"
     assert simulator["stale"] is False

@@ -26,6 +26,11 @@ Route table implemented here (CONTRACT.md section 9):
     POST /api/v1/investigate                             events.py
     GET  /api/v1/admin/faults                            admin.py
     POST /api/v1/admin/faults                            admin.py
+    POST /api/v1/admin/faults/clear                       admin.py
+    GET  /api/v1/admin/audit                              admin.py
+    GET  /api/v1/admin/events                             admin.py
+    POST /api/v1/admin/events                             admin.py
+    POST /api/v1/admin/toggle                             admin.py
     POST /api/v1/admin/simulation/{action}                admin.py
     GET  /metrics                                        health.py
 """

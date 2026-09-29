@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from app.api.intelligence import build_history
+from app.api.intelligence import _derive_idempotency_key, build_history
 
 import test_api_support  # noqa: F401
 from test_api_support import (
@@ -394,3 +394,126 @@ async def test_the_simulators_own_demand_history_reaches_the_engines() -> None:
     assert len(points) == 1
     assert points[0].liters == 53.255
     assert points[0].tick == 4100
+
+
+# ---------------------------------------------------------------------------
+# The idempotency key a submission carries
+# ---------------------------------------------------------------------------
+
+
+def test_the_derived_key_follows_the_decision_content_not_the_clock() -> None:
+    """Guide section 5.4 makes a used key permanently occupied on the simulator.
+
+    That memory outlives this process, so a key derived from the tick was wrong
+    twice over: a restart replayed a previous run's allocation at the same tick,
+    and two different decisions inside one tick collided onto one key. Keying on
+    the content keeps only the property worth having.
+    """
+    fields = {"depot_id": "DP-1", "station_id": "ST-2", "route_id": "RT-1", "fuel_type": "DIESEL"}
+    same = _derive_idempotency_key("rec-1", quantity=2500.0, **fields)
+    assert _derive_idempotency_key("rec-1", quantity=2500.0, **fields) == same
+
+    assert _derive_idempotency_key("rec-1", quantity=1000.0, **fields) != same
+    assert _derive_idempotency_key("rec-1", quantity=2500.0, **{**fields, "route_id": "RT-3"}) != same
+    assert _derive_idempotency_key("rec-2", quantity=2500.0, **fields) != same
+
+
+def test_the_derived_key_fits_the_documented_length_ceiling() -> None:
+    """Guide section 5.1: 1-150 characters, so a long id must not overflow it."""
+    key = _derive_idempotency_key(
+        "r" * 500,
+        depot_id="DP-1",
+        station_id="ST-2",
+        route_id="RT-1",
+        fuel_type="DIESEL",
+        quantity=2500.0,
+    )
+    assert 1 <= len(key) <= 150
+    # The digest is the part that must survive: truncating the finished string
+    # instead would let two different decisions share a key.
+    assert key.endswith(key.rsplit("-", 1)[-1])
+    assert len(key.rsplit("-", 1)[-1]) == 16
+
+
+def test_overriding_the_quantity_is_a_new_decision_not_a_replay() -> None:
+    """The operator asked for a different size; answering with the old
+    allocation would be a silent lie about what was dispatched."""
+    simulator = FakeSimulatorClient()
+    http = client(build_app(client=simulator))
+    http.post(f"/api/v1/recommendations/{SUBJECT}/submit", json={"confirm": True})
+    http.post(
+        f"/api/v1/recommendations/{SUBJECT}/submit",
+        json={"confirm": True, "quantity_liters": 1000.0},
+    )
+    keys = [payload["idempotency_key"] for payload in simulator.allocations]
+    assert keys[0] != keys[1], "a different size is a different decision"
+
+
+def test_a_non_positive_quantity_is_refused_before_the_simulator_is_called() -> None:
+    simulator = FakeSimulatorClient()
+    http = client(build_app(client=simulator))
+    for bad in (0, -5):
+        response = http.post(
+            f"/api/v1/recommendations/{SUBJECT}/submit",
+            json={"confirm": True, "quantity_liters": bad},
+        )
+        assert response.status_code == 422, bad
+    assert simulator.allocations == [], "a refused request must not reach the simulator"
+
+
+def test_an_infinite_quantity_is_refused_at_the_boundary() -> None:
+    """`gt=0` alone accepts `inf`, which serialises as the non-standard JSON
+    literal `Infinity` and reaches the simulator as an unparseable body."""
+    simulator = FakeSimulatorClient()
+    response = client(build_app(client=simulator)).post(
+        f"/api/v1/recommendations/{SUBJECT}/submit",
+        json={"confirm": True, "quantity_liters": 1e999},
+    )
+    assert response.status_code == 422
+    assert simulator.allocations == []
+
+
+def test_a_recommendation_with_no_usable_size_is_a_typed_409() -> None:
+    """The size can also come from the recommendation, which no request model
+    ever validates. It must fail as a typed, explainable error."""
+
+    class SizelessAllocator(FakeAllocator):
+        def recommend(self, *, snapshot, signals, forecasts, budget_liters=None):
+            return [
+                SimpleNamespace(**{**rec.__dict__, "quantity_liters": None})
+                for rec in super().recommend(
+                    snapshot=snapshot, signals=signals, forecasts=forecasts,
+                    budget_liters=budget_liters,
+                )
+            ]
+
+    response = client(build_app(allocator=SizelessAllocator())).post(
+        f"/api/v1/recommendations/{SUBJECT}/submit", json={"confirm": True}
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "recommendation_incomplete"
+    assert response.json()["detail"]["details"]["missing"] == ["quantity"]
+
+
+def test_a_recommendation_spelling_its_id_differently_still_resolves() -> None:
+    """`id` is pinned, but a drift to `recommendation_id` across this seam fails
+    closed: every lookup would 404 and a live recommendation would be reported
+    as non-existent."""
+
+    class AliasedAllocator(FakeAllocator):
+        def recommend(self, *, snapshot, signals, forecasts, budget_liters=None):
+            out = []
+            for rec in super().recommend(
+                snapshot=snapshot, signals=signals, forecasts=forecasts,
+                budget_liters=budget_liters,
+            ):
+                payload = {**rec.__dict__, "recommendation_id": rec.__dict__["id"]}
+                del payload["id"]
+                out.append(SimpleNamespace(**payload))
+            return out
+
+    response = client(build_app(allocator=AliasedAllocator())).get(
+        f"/api/v1/recommendations/{SUBJECT}/explanation"
+    )
+    assert response.status_code == 200, response.text[:200]
+    assert response.json()["recommendation_id"] == SUBJECT

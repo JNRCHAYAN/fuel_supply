@@ -805,7 +805,12 @@ class SubmitRequest(BaseModel):
     #: Guide section 5.1: `idempotency_key` is 1-150 characters on the wire.
     #: A longer key is a 422 from the simulator, so it is rejected here instead.
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=150)
-    quantity_liters: float | None = Field(default=None, gt=0)
+    #: `allow_inf_nan=False` because `gt=0` alone accepts `inf`: a payload of
+    #: `{"quantity_liters": 1e999}` passes the bound, is serialised as the
+    #: non-standard JSON literal `Infinity`, and reaches the simulator as an
+    #: unparseable body. Better to refuse it at the boundary, where the operator
+    #: can see which field was wrong.
+    quantity_liters: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     note: str | None = Field(default=None, max_length=1000)
     model_config = _ALLOW_EXTRA
 
