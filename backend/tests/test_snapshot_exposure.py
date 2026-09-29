@@ -120,7 +120,8 @@ def test_assembled_snapshot_with_an_open_breaker_is_not_called_fresh() -> None:
 def test_assembled_snapshot_with_a_closed_breaker_is_fresh() -> None:
     body = client(build_app(client=FakeSimulatorClient())).get(SNAPSHOT_PATH).json()
     assert body["stale"] is False
-    assert body["age_seconds"] == 0.0
+    # Assembly and response serialization take real monotonic time.
+    assert 0.0 <= body["age_seconds"] < 1.0
 
 
 def test_staleness_reaches_the_per_entity_reads_too() -> None:

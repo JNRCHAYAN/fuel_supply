@@ -286,6 +286,10 @@ class SimulatorClient:
         self._sleep = sleep
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
+        # The published simulator has a small database pool. Coalescing only
+        # merges identical reads; snapshot fan-out and distinct history queries
+        # still need a shared bound. SSE must not hold one of these REST slots.
+        self._request_slots = asyncio.Semaphore(2)
 
         self._breaker = CircuitBreaker(
             failure_threshold=int(_setting(settings, "circuit_failure_threshold", 5)),
@@ -1066,9 +1070,10 @@ class SimulatorClient:
 
         for attempt in range(self._max_attempts):
             try:
-                response = await self._http().request(
-                    method, path, params=params, json=json_body
-                )
+                async with self._request_slots:
+                    response = await self._http().request(
+                        method, path, params=params, json=json_body
+                    )
             except httpx.TransportError as exc:
                 # Timeout, connect, read and protocol failures: the simulator is
                 # unreachable or unhealthy. Always retryable.

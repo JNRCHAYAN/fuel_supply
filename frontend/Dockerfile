@@ -40,11 +40,12 @@ FROM nginx:1.27-alpine AS runtime
 # Where nginx proxies /v1/*. Overridable at run time, so the image can be
 # pointed at a simulator on another host without a rebuild.
 ENV SIMULATOR_UPSTREAM=http://simulator-api:8000
+ENV BACKEND_UPSTREAM=http://backend:9000
 
 # Restrict the image's envsubst pass to our own variable. Without this the
 # entrypoint would also try to substitute nginx's runtime variables ($uri,
 # $host, $proxy_add_x_forwarded_for) and silently blank them out of the config.
-ENV NGINX_ENVSUBST_FILTER=SIMULATOR_
+ENV NGINX_ENVSUBST_FILTER="^(SIMULATOR_|BACKEND_)"
 
 COPY --from=build /app/dist /usr/share/nginx/html
 COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
@@ -52,6 +53,6 @@ COPY nginx/default.conf.template /etc/nginx/templates/default.conf.template
 EXPOSE 80
 
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://localhost/ >/dev/null 2>&1 || exit 1
+  CMD wget -qO- http://127.0.0.1/ >/dev/null 2>&1 || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

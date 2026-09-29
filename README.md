@@ -1,5 +1,24 @@
 # Fuel Supply Intelligence & Resilience Platform
 
+## Current milestone: Operations Dashboard
+
+Feature 1 now connects to the FastAPI backend through same-origin `/api/v1/*`
+requests. It displays station and depot inventories by fuel, regional filters,
+incoming deliveries, active disruptions, simulation time, and component health.
+It refreshes every five seconds and retains clearly marked last-known data when
+the backend is unavailable. Light and dark themes and mobile layouts are included.
+Recommendations and the remaining operator screens are subsequent milestones.
+
+Run the stack with `docker compose up --build -d`, then open
+[the dashboard](http://localhost:8080). For frontend development, run `npm ci`
+and `npm run dev` inside `frontend/`; Vite proxies `/api` to the backend on port
+9000. The dashboard requires the backend and supplied simulator. The older mock
+client remains available for isolated tests but does not populate this dashboard.
+
+The backend limits concurrent simulator REST requests to two to protect the
+published simulator's small database connection pool. The simulator image is
+unchanged. This bound applies per backend process.
+
 A full-stack decision-support platform for the **BUP CSE Fest 2026 Hackathon
 Finals** challenge. It surfaces the state of a simulated national fuel supply
 network — depots, stations, routes, inventories, allocations and disruption
@@ -150,9 +169,9 @@ npm install
 npm run dev
 ```
 
-The dev server runs at <http://localhost:5173>. By default it needs no simulator
-and no backend at all — it runs the in-browser world engine (see
-[Two data modes](#two-data-modes)).
+The dev server runs at <http://localhost:5173>. The Operations Dashboard needs
+the backend on port 9000 and the supplied simulator. The in-browser world engine
+is retained for isolated client tests (see [Two data modes](#two-data-modes)).
 
 ---
 

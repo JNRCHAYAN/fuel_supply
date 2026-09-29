@@ -1469,3 +1469,24 @@ async def test_a_read_after_the_memo_window_reaches_the_simulator_again():
 
     assert counter.count == 2, "an expired memo must not be served"
     await client.aclose()
+
+@pytest.mark.asyncio
+async def test_distinct_reads_bound_upstream_concurrency():
+    """Snapshot fan-out must not exhaust the simulator's small SQL pool."""
+    active = 0
+    peak = 0
+    async def handler(request):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.01)
+            return httpx.Response(200, json=[])
+        finally:
+            active -= 1
+    client = SimulatorClient(Settings(simulator_base_url=BASE_URL), transport=httpx.MockTransport(handler))
+    try:
+        await asyncio.gather(*(client.get_demand_history(station_id=f'station-{i}') for i in range(20)))
+        assert peak <= 2, f'{peak} simultaneous requests can exhaust the simulator pool'
+    finally:
+        await client.aclose()

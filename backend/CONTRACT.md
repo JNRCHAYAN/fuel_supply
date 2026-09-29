@@ -178,6 +178,7 @@ environment with pydantic-settings; `backend/.env` is git-ignored.
 | `SIMULATOR_BASE_URL` | `http://simulator-api:8000` | Simulator root |
 | `SIMULATOR_TIMEOUT_SECONDS` | `10` | Per-request timeout |
 | `SIMULATOR_MAX_RETRIES` | `3` | Tenacity retry attempts |
+| `SIMULATOR_CACHE_TTL_SECONDS` | `1` | Reuse successful reads and coalesce concurrent requests |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | Failures before the breaker opens |
 | `CIRCUIT_RESET_SECONDS` | `30` | Open→half-open delay |
 | `DATABASE_URL` | `sqlite+aiosqlite:///./data/fuel.db` | Storage |

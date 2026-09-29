@@ -246,7 +246,7 @@ def test_a_simulator_failure_during_fault_injection_is_typed() -> None:
     broken = FakeSimulatorClient()
     broken.fail_on = {"admin_inject_fault"}
     response = client(build_app(client=broken)).post(
-        "/api/v1/admin/faults", json={"type": "simulator_500"}
+        "/api/v1/admin/faults", json={"type": "unavailable"}
     )
     assert response.status_code == 502
     assert error_code(response) == "simulator_error"
@@ -343,7 +343,7 @@ def test_every_predictive_or_advisory_response_is_marked_simulated() -> None:
     posts = [
         ("/api/v1/events/summary", None),
         ("/api/v1/investigate", {"question": "why is ST-2 short?"}),
-        ("/api/v1/admin/faults", {"type": "simulator_500"}),
+        ("/api/v1/admin/faults", {"type": "unavailable"}),
         ("/api/v1/admin/simulation/step", None),
         (f"/api/v1/recommendations/{SUBJECT}/submit", {"confirm": True}),
     ]

@@ -687,6 +687,9 @@ def build_app(**overrides: Any) -> FastAPI:
     `app/api/health.py` are replaced. Nothing is monkeypatched.
     """
     app = FastAPI(title="API test app")
+    # Match production's JSON-safe validation responses, including infinity.
+    from app.main import _install_validation_error_handler
+    _install_validation_error_handler(app)
     app.include_router(api_router)
 
     settings = overrides.get("settings", fake_settings())
