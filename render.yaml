@@ -1,0 +1,109 @@
+# Render Blueprint — Fuel Supply Intelligence & Resilience Platform
+# https://render.com/docs/blueprint-spec
+#
+# How to use:
+#   1. Push this repo to GitHub/GitLab/Bitbucket.
+#   2. In the Render Dashboard go to "New" -> "Blueprint" and point it at this
+#      repo. Render reads this file and creates every service below.
+#   3. Set DEEPSEEK_API_KEY in the Render Dashboard on the `fuel-supply-backend`
+#      service (Environment tab). Leave it blank to run the templated fallback.
+#
+# Notes for judges / operators:
+#   * Three services are declared: the published simulator (private), the
+#     FastAPI backend (web) and the React/nginx frontend (web). They mirror
+#     docker-compose.yml exactly.
+#   * The frontend and backend use Docker because they already ship Dockerfiles;
+#     the simulator pulls the upstream image by tag (CONTRACT §0.5 / integration
+#     guide §2: "Judges run your submission against the published image").
+#   * On Render, service-to-service DNS is <service-name>.onrender.com. The
+#     internal URL for a Private Service is the same name. We use that instead
+#     of localhost.
+#   * The SQLite database lives on a persistent disk mounted at /app/data so it
+#     survives redeploys. Free Web Services do NOT support persistent disks;
+#     for the free tier use the in-memory mode described in render.md.
+#   * `healthCheckPath` points at /api/v1/health on the backend, which is the
+#     dependency-free liveness endpoint the contract specifies.
+
+services:
+  # ----------------------------------------------------------------------
+  # 1. Simulator — the published BUP image, pulled unmodified.
+  # ----------------------------------------------------------------------
+  - type: pserv
+    runtime: image
+    name: fuel-supply-simulator
+    plan: starter
+    image:
+      url: docker.io/asifmahmoud414/bup-fuel-supply-simulator:1.0.0
+    envVars:
+      - key: SIMULATION_SPEED
+        value: "8"
+      - key: TICK_MINUTES
+        value: "15"
+      - key: SIMULATOR_START_MODE
+        value: running
+    healthCheckPath: /v1/health
+
+  # ----------------------------------------------------------------------
+  # 2. Backend — the FastAPI intelligence service.
+  # ----------------------------------------------------------------------
+  - type: web
+    runtime: docker
+    name: fuel-supply-backend
+    plan: starter
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/v1/health
+    envVars:
+      # Internal DNS on Render — services on the same account/region resolve
+      # each other by name. The simulator runs as a Private Service.
+      - key: SIMULATOR_BASE_URL
+        value: http://fuel-supply-simulator:8000
+      - key: DATABASE_URL
+        value: sqlite+aiosqlite:////app/data/fuel.db
+      - key: LLM_ENABLED
+        value: "true"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: STOCKOUT_HORIZON_TICKS
+        value: "8"
+      - key: STOCKOUT_CRITICAL_TICKS
+        value: "1.0"
+      - key: STOCKOUT_HIGH_TICKS
+        value: "3.0"
+      - key: STOCKOUT_SAFETY_STOCK_FRACTION
+        value: "0.25"
+      # The DeepSeek key. Set this in the Render Dashboard, NOT here — it would
+      # be committed to git otherwise. Leave it as the sync:false placeholder
+      # so Render treats it as a secret you must populate.
+      - key: DEEPSEEK_API_KEY
+        sync: false
+      # Allow the frontend origin (filled in by Render once that service exists)
+      # plus localhost so you can curl the API during judging.
+      - key: CORS_ALLOW_ORIGINS
+        value: "*"
+      - key: PORT
+        value: "9000"
+    # Persistent disk for the SQLite decision history. Requires a paid plan;
+    # on the free tier use an in-memory DB instead (see render.md).
+    disk:
+      name: fuel-backend-data
+      mountPath: /app/data
+      sizeGB: 1
+
+  # ----------------------------------------------------------------------
+  # 3. Frontend — the React/nginx operator console.
+  # ----------------------------------------------------------------------
+  - type: web
+    runtime: docker
+    name: fuel-supply-frontend
+    plan: starter
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    healthCheckPath: /
+    envVars:
+      # The nginx template inside the frontend image env-substitutes these.
+      # We point at the backend's Render internal URL.
+      - key: BACKEND_UPSTREAM
+        value: http://fuel-supply-backend:9000
+      - key: SIMULATOR_UPSTREAM
+        value: http://fuel-supply-simulator:8000
