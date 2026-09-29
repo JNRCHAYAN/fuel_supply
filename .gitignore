@@ -36,11 +36,23 @@ Thumbs.db
 # Test / coverage
 coverage/
 
-# Python (backend — not built yet, reserved)
+# Python (backend)
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.db
+*.sqlite3
+
+# The backend reads DEEPSEEK_API_KEY from here. Never commit a populated .env —
+# .env.example is the committed template and carries no real values.
+backend/.env
+backend/data/
 
 # Claude Code worktrees
 .claude/worktrees/

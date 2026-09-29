@@ -1,0 +1,124 @@
+# Reproducible deployment for the Fuel Supply Intelligence & Resilience Platform
+# (brief §19 "Deployment: A reproducible deployment method").
+#
+#   docker compose up --build
+#
+# Then open http://localhost:8080 for the operator console and
+# http://localhost:8000/admin for the simulator's own dashboard.
+#
+# The backend API is published on http://localhost:9000 — Swagger UI at /docs.
+# To use the DeepSeek explanations, put DEEPSEEK_API_KEY=... in a .env file
+# next to this one (git-ignored) or export it before `up`. Without it the
+# backend runs normally and every explanation comes from the deterministic
+# templated fallback, which is a supported mode, not an error.
+#
+# The three services are deliberately separate. The simulator is the published
+# BUP image and is never modified (integration guide §2: "Judges run your
+# submission against the published image"), so it is pinned by tag below.
+
+services:
+  simulator-api:
+    image: asifmahmoud414/bup-fuel-supply-simulator:1.0.0
+    container_name: fuel-simulator-api
+    environment:
+      # Wall-clock ticks per second while running.
+      SIMULATION_SPEED: ${SIMULATION_SPEED:-8}
+      # Simulated minutes advanced per tick.
+      TICK_MINUTES: ${TICK_MINUTES:-15}
+      # The guide's own default is "paused", which leaves the dashboard sitting
+      # on tick 0 until someone resumes it. Defaulted to "running" here so the
+      # stack is immediately useful to test against; override with
+      # SIMULATOR_START_MODE=paused if you want to drive the clock yourself.
+      SIMULATOR_START_MODE: ${SIMULATOR_START_MODE:-running}
+    ports:
+      # Exposed on the host so the simulator's own /admin dashboard and
+      # /docs Swagger UI are reachable directly, as the guide documents.
+      #
+      # The host port is a variable because 8000 is frequently already taken
+      # (any other local API will do it). Changing it does NOT affect the
+      # frontend: the browser talks to the frontend container, and nginx
+      # reaches the simulator over the compose network at
+      # http://simulator-api:8000 regardless of what is published on the host.
+      # Override with SIMULATOR_HOST_PORT=8001 if 8000 is in use.
+      - "${SIMULATOR_HOST_PORT:-8000}:8000"
+    healthcheck:
+      # /v1/health is the one endpoint that bypasses fault injection, which is
+      # exactly what a liveness probe needs (guide §7.10).
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: fuel-supply-backend
+    environment:
+      # Reaches the simulator over the compose network, not the published host
+      # port, so changing SIMULATOR_HOST_PORT above cannot break this.
+      SIMULATOR_BASE_URL: http://simulator-api:8000
+      # Absolute path inside the container; the relative default in config.py
+      # would resolve against the process working directory instead.
+      DATABASE_URL: sqlite+aiosqlite:////app/data/fuel.db
+      # Read from the shell environment or a git-ignored .env at the repo root
+      # (compose loads that file automatically). The value is passed to the
+      # container at RUNTIME and is never a build arg, so it cannot be baked
+      # into an image layer. Empty is a supported state: every LLM-dependent
+      # path falls back to the deterministic templated explanation (brief §11).
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      LLM_ENABLED: ${LLM_ENABLED:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      # Published so the operator API can be exercised directly with curl, and
+      # so /docs (Swagger UI) is reachable during judging.
+      - "${BACKEND_HOST_PORT:-9000}:9000"
+    volumes:
+      # Decision history and snapshots must survive a container restart; the
+      # in-container path is the one DATABASE_URL points at.
+      - backend-data:/app/data
+    depends_on:
+      simulator-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:9000/api/v1/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Build-time, not runtime: Vite inlines import.meta.env into the bundle.
+        VITE_SIMULATOR_MODE: live
+        # Empty on purpose. This makes the SPA issue requests to /v1/* on its
+        # own origin, which nginx proxies to the simulator below. The browser
+        # is therefore same-origin and the deployment does not depend on the
+        # simulator's CORS behaviour — the integration guide documents none.
+        VITE_SIMULATOR_BASE_URL: ""
+    container_name: fuel-supply-frontend
+    environment:
+      # Runtime-configurable, so the image can be repointed at a simulator on
+      # another host without rebuilding. Consumed by nginx via envsubst.
+      SIMULATOR_UPSTREAM: http://simulator-api:8000
+    ports:
+      - "8080:80"
+    depends_on:
+      simulator-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  # Named so decision history and recorded snapshots survive `docker compose
+  # down`; `down -v` removes it deliberately.
+  backend-data:
