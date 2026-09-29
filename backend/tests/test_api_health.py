@@ -71,6 +71,20 @@ def test_health_is_unaffected_by_a_dead_simulator_and_database() -> None:
     assert response.json()["status"] == "ok"
 
 
+def test_health_and_status_answer_different_questions() -> None:
+    """Liveness vs component status: the two must not be conflated.
+
+    `/health` says "this process is running"; `/status` says "everything it
+    depends on is healthy". A degraded *dependency* belongs on the second, and
+    must never fail the first -- see the module docstring in `app/api/health.py`.
+    """
+    app = build_app(client=FakeSimulatorClient(breaker_state="open"))
+    health = client(app).get("/api/v1/health").json()
+    status = client(app).get("/api/v1/status").json()
+    assert health["status"] == "ok"
+    assert status["status"] == "degraded"
+
+
 # ---------------------------------------------------------------------------
 # /api/v1/status
 # ---------------------------------------------------------------------------
@@ -117,6 +131,37 @@ def test_status_marks_the_simulator_down_when_it_fails() -> None:
     body = client(build_app(client=broken)).get("/api/v1/status").json()
     assert body["components"]["simulator"]["status"] == "down"
     assert body["status"] == "down"
+
+
+def test_status_simulator_carries_the_evidence_for_its_verdict() -> None:
+    """`ok` now has to mean *live*: `stale` and `breaker_state` say so.
+
+    Brief section 15 wants the operator to understand whether the system is
+    healthy; a bare `ok` cannot be told apart from a cached value served while
+    the circuit breaker was open.
+    """
+    simulator = client(build_app()).get("/api/v1/status").json()["components"]["simulator"]
+    assert simulator["status"] == "ok"
+    assert simulator["stale"] is False
+    assert simulator["breaker_state"] == "closed"
+
+
+def test_status_reports_a_cached_simulator_reading_as_degraded() -> None:
+    """An OPEN breaker serving last-good must not read as `ok`.
+
+    Regression for the status page printing "Fuel Simulator: Healthy" from cache
+    during a real outage -- see `tests/test_health_degradation.py`.
+    """
+    body = (
+        client(build_app(client=FakeSimulatorClient(breaker_state="open")))
+        .get("/api/v1/status")
+        .json()
+    )
+    simulator = body["components"]["simulator"]
+    assert simulator["status"] == "degraded"
+    assert simulator["stale"] is True
+    assert simulator["breaker_state"] == "open"
+    assert body["status"] == "degraded"
 
 
 def test_status_mentions_an_open_circuit_breaker() -> None:

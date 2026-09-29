@@ -18,9 +18,28 @@ from test_api_support import (
 )
 
 
+def _snapshot(*, stale: bool = False, age_seconds: float = 0.0, taken_at: float = 0.0):
+    return SimpleNamespace(
+        taken_at=taken_at,
+        tick=TICK,
+        sim_time="2026-09-29T09:55:00Z",
+        status="RUNNING",
+        depots=DEPOTS,
+        stations=STATIONS,
+        routes=ROUTES,
+        regions=REGIONS,
+        supply_arrivals=(),
+        events=(),
+        metrics={"service_level": 0.9},
+        stale=stale,
+        age_seconds=age_seconds,
+    )
+
+
 class RichSimulatorClient(FakeSimulatorClient):
-    """Adds the two surfaces the plain fake leaves out: a one-shot snapshot and
-    a populated demand history."""
+    """Adds the two surfaces the plain fake leaves out: the cache-aware
+    snapshot the *real* client defines (`build_snapshot`), and a populated
+    demand history."""
 
     def __init__(self, *, stale: bool = False, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -42,22 +61,18 @@ class RichSimulatorClient(FakeSimulatorClient):
             rows = [r for r in rows if r["station_id"] == station_id]
         return rows[:limit]
 
+    async def build_snapshot(self):
+        # app/sim/client.py: `build_snapshot` is the method the real
+        # SimulatorClient exposes; there is no `get_snapshot` to probe for.
+        return _snapshot(stale=self.stale, age_seconds=12.5 if self.stale else 0.0)
+
+
+class OneShotSnapshotClient(FakeSimulatorClient):
+    """A client offering only a one-shot `get_snapshot` and no cache-aware read:
+    the fallback the route must still accept."""
+
     async def get_snapshot(self):
-        return SimpleNamespace(
-            taken_at=0.0,
-            tick=TICK,
-            sim_time="2026-09-29T09:55:00Z",
-            status="RUNNING",
-            depots=DEPOTS,
-            stations=STATIONS,
-            routes=ROUTES,
-            regions=REGIONS,
-            supply_arrivals=(),
-            events=(),
-            metrics={"service_level": 0.9},
-            stale=self.stale,
-            age_seconds=12.5 if self.stale else 0.0,
-        )
+        return _snapshot()
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +96,13 @@ def test_snapshot_returns_the_whole_network() -> None:
 
 
 def test_snapshot_reports_staleness_from_the_last_good_cache() -> None:
-    """CONTRACT.md 5.5: a degraded snapshot is served marked stale, not faked."""
+    """CONTRACT.md 5.5: a degraded snapshot is served marked stale, not faked.
+
+    `build_snapshot` is the real client's cache-aware read (app/sim/client.py) —
+    the *only* method that carries `stale`/`age_seconds`. Probing for a
+    `get_snapshot` that does not exist made this route hardcode "fresh", so this
+    test fails against that code.
+    """
     body = client(build_app(client=RichSimulatorClient(stale=True))).get(
         "/api/v1/network/snapshot"
     ).json()
@@ -89,33 +110,29 @@ def test_snapshot_reports_staleness_from_the_last_good_cache() -> None:
     assert body["age_seconds"] == 12.5
 
 
-def test_snapshot_prefers_a_one_shot_get_snapshot_when_the_client_has_one() -> None:
+def test_snapshot_prefers_the_cache_aware_build_snapshot_when_the_client_has_one() -> None:
     body = client(build_app(client=RichSimulatorClient())).get(
         "/api/v1/network/snapshot"
     ).json()
     assert body["sim_time"] == "2026-09-29T09:55:00Z"
+    assert body["stale"] is False
+
+
+def test_snapshot_falls_back_to_a_one_shot_get_snapshot() -> None:
+    """A client with only the one-shot getter is still accepted."""
+    body = client(build_app(client=OneShotSnapshotClient())).get(
+        "/api/v1/network/snapshot"
+    ).json()
+    assert body["sim_time"] == "2026-09-29T09:55:00Z"
+    assert body["status"] == "RUNNING"
 
 
 def test_snapshot_marks_an_aged_snapshot_stale_even_if_the_client_does_not() -> None:
     """The console must not present aged data as live."""
-    snapshot = SimpleNamespace(
-        taken_at=time.monotonic() - 600.0,  # ten minutes old by this clock
-        tick=TICK,
-        sim_time="2026-09-29T09:00:00Z",
-        status="RUNNING",
-        depots=(),
-        stations=(),
-        routes=(),
-        regions=(),
-        supply_arrivals=(),
-        events=(),
-        metrics={},
-        stale=False,
-        age_seconds=0.0,
-    )
+    snapshot = _snapshot(taken_at=time.monotonic() - 600.0)
 
     class AgedClient(FakeSimulatorClient):
-        async def get_snapshot(self):
+        async def build_snapshot(self):
             return snapshot
 
     body = client(build_app(client=AgedClient())).get("/api/v1/network/snapshot").json()

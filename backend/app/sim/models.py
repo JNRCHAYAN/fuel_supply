@@ -292,6 +292,26 @@ def _optional_integer(payload: Mapping[str, Any], key: str, *, model: str) -> in
         ) from exc
 
 
+def _optional_number(payload: Mapping[str, Any], key: str, *, model: str) -> float | None:
+    """A number, or ``None`` when the field is absent or explicitly null.
+
+    Deliberately *not* ``_number`` with a default: for a ratio like
+    ``service_level`` (guide 4.12: ``served / (served + unmet)``, where 1.0 means
+    zero unmet demand) a coerced 0.0 is a positive claim of total failure, while
+    an absent field only means the simulator did not report one. The unknown
+    case has to stay distinguishable from a real zero.
+    """
+    value = payload.get(key, _MISSING)
+    if value is _MISSING or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{model}.{key}: expected a number or null, got {value!r}"
+        ) from exc
+
+
 def _optional_text(payload: Mapping[str, Any], key: str) -> str | None:
     value = payload.get(key)
     if value is None:
@@ -438,11 +458,15 @@ class Metrics:
         {"served_demand_liters": 90900.0, "unmet_demand_liters": 3680414.477,
          "service_level": 0.024103, "allocation_liters": 5000.0,
          "allocation_failures": 0}
+
+    ``service_level`` is ``served / (served + unmet)`` (guide 4.12), so 0.0 is
+    a real measurement -- total failure -- and ``None`` is the only honest value
+    for a missing or null field. The two must not be conflated.
     """
 
     served_demand_liters: float
     unmet_demand_liters: float
-    service_level: float
+    service_level: float | None
     allocation_liters: float
     allocation_failures: int
 
@@ -456,7 +480,7 @@ class Metrics:
             unmet_demand_liters=_number(
                 data, "unmet_demand_liters", model="Metrics", default=0.0
             ),
-            service_level=_number(data, "service_level", model="Metrics", default=0.0),
+            service_level=_optional_number(data, "service_level", model="Metrics"),
             allocation_liters=_number(
                 data, "allocation_liters", model="Metrics", default=0.0
             ),
@@ -646,9 +670,15 @@ class SupplyArrival:
 class DomainEvent:
     """``GET /v1/events``::
 
-        {"id": 1, "type": "demand_spike", "start_tick": 500, "end_tick": 520,
-         "status": "RESOLVED", "parameters": {"region_id": "region-dhaka",
-                                              "factor": 1.5}}
+        {"id": 1, "type": "demand_spike", "start_tick": 8, "end_tick": 20,
+         "status": "RESOLVED",
+         "parameters": {"region_ids": ["region-dhaka"], "multiplier": 1.8}}
+
+    ``parameters`` is free-form because each event type carries its own keys
+    (guide 4.9, 7.8), but they are always *plural list filters* plus a scalar:
+    ``station_ids`` / ``region_ids`` / ``route_ids`` / ``depot_ids`` /
+    ``fuel_types`` alongside ``multiplier``, ``factor`` or ``delay_ticks``.
+    An empty filter list means "every entity of that type".
     """
 
     id: int

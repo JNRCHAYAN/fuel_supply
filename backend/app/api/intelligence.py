@@ -18,6 +18,7 @@ the simulator, and it requires an explicit `confirm: true` — brief section 24'
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -70,6 +71,54 @@ async def _call(method: Any, *args: Any, **kwargs: Any) -> Any:
     return await _maybe_await(method(*args, **kwargs))
 
 
+#: The simulator's wire name for the measurement is ``demand_liters`` (guide
+#: section 4.11); the engines' pinned ``DemandPoint`` calls it ``liters``
+#: (CONTRACT.md 5.2). This is the whole bridge between the two.
+_DEMAND_FIELD_ALIASES: dict[str, str] = {"demand_liters": "liters"}
+
+
+def _to_demand_point(row: Any) -> Any | None:
+    """Project one ``/v1/demand-history`` row onto the engines' ``DemandPoint``.
+
+    The wire spells the measurement ``demand_liters``; ``DemandPoint`` spells it
+    ``liters``. Projecting a row by field name alone therefore failed on a
+    missing required field on **every single row**: ``build_peer_model`` saw
+    ``liters`` absent with no default, gave up, and returned the raw wire dict.
+    The caller then skipped it, ``history`` stayed empty, and the code fell
+    through to the persisted SQLite store.
+
+    The effect was silent and total: ``/v1/demand-history`` -- which CONTRACT.md
+    5.5 makes the source of truth -- was fetched (1500 rows per request) and
+    discarded, while forecasting, risk detection and allocation ran on a delayed,
+    de-duplicated subset written by the 2-second ingest poll, or on nothing at
+    all after a reset. Nothing raised, so nothing looked wrong.
+
+    ``DemandObservation`` already offers this projection as ``to_demand_point()``
+    (and a ``liters`` property). This accepts that object, an already-projected
+    ``DemandPoint``, or a plain wire mapping, and returns ``None`` only when the
+    row genuinely cannot be projected -- which the caller logs rather than
+    swallowing.
+    """
+    projector = getattr(row, "to_demand_point", None)
+    if callable(projector):
+        try:
+            return projector()
+        except Exception:  # noqa: BLE001 - fall through to the mapping path
+            pass
+
+    data = row if isinstance(row, Mapping) else to_jsonable(row)
+    if not isinstance(data, Mapping):
+        return None
+    projected = dict(data)
+    for wire_name, engine_name in _DEMAND_FIELD_ALIASES.items():
+        if engine_name not in projected and wire_name in projected:
+            projected[engine_name] = projected[wire_name]
+
+    point = build_peer_model("app.sim.models", ("DemandPoint",), projected)
+    return None if isinstance(point, dict) else point
+
+
+
 # ---------------------------------------------------------------------------
 # Composition helpers (shared with events.py)
 # ---------------------------------------------------------------------------
@@ -104,9 +153,19 @@ async def build_history(
                 detail={"exc": type(exc).__name__},
             )
             rows = None
-        for row in to_jsonable(rows) or []:
-            point = build_peer_model("app.sim.models", ("DemandPoint",), row or {})
-            if isinstance(point, dict):
+        for row in rows or []:
+            point = _to_demand_point(row)
+            if point is None:
+                # A row we cannot project is dropped, but never silently: a
+                # wire-format drift that empties this history is exactly the
+                # failure this log line exists to make visible.
+                record_failure(
+                    logger,
+                    metrics,
+                    event="demand_row_unprojectable",
+                    code="demand_projection_error",
+                    detail={"row_type": type(row).__name__},
+                )
                 continue
             key = (getattr(point, "station_id", None), getattr(point, "fuel_type", None))
             if key[0] is None or key[1] is None:
@@ -352,6 +411,31 @@ def _snapshot_tick(snapshot: Any) -> int | None:
     return int(tick) if isinstance(tick, (int, float)) else None
 
 
+def _derive_idempotency_key(
+    rec_id: str,
+    *,
+    depot_id: Any,
+    station_id: Any,
+    route_id: Any,
+    fuel_type: Any,
+    quantity: Any,
+) -> str:
+    """A stable key for one *decision*, derived from what that decision contains.
+
+    The call site explains why the tick is deliberately absent from the
+    material. The id is clipped before the digest is appended rather than
+    truncating the finished string, so the digest can never be the part that
+    gets cut off — two different decisions must not collide into one key.
+    120 + 1 + 16 keeps the result inside the 150-character ceiling the
+    simulator enforces (guide section 5.1).
+    """
+    material = "|".join(
+        str(part) for part in (rec_id, depot_id, station_id, route_id, fuel_type, quantity)
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    return f"{str(rec_id)[:120]}-{digest}"
+
+
 async def _generate(
     client: Any,
     repository: Any,
@@ -493,7 +577,33 @@ async def _find_recommendation(
     snapshot, signals, computed, recommendations = await _generate(
         client, repository, forecaster, detector, allocator, metrics
     )
-    match = next((r for r in recommendations if str(getattr(r, "id", "")) == rec_id), None)
+
+    # `id` is the pinned spelling (CONTRACT.md 7.3). Some revisions of the
+    # allocation engine publish the same value as `recommendation_id`, and a
+    # name drift across this seam fails *closed* in the worst way: no id ever
+    # matches, so every lookup 404s and a perfectly good recommendation is
+    # reported as non-existent. Accept either spelling — but never silently,
+    # because a set of recommendations from which no id can be read at all is a
+    # broken seam, not an empty result.
+    def _identity(rec: Any) -> str:
+        for attr in ("id", "recommendation_id"):
+            value = getattr(rec, attr, None)
+            if value is not None and value != "":
+                return str(value)
+        return ""
+
+    match = next((r for r in recommendations if _identity(r) == rec_id), None)
+    if not any(_identity(r) for r in recommendations) and recommendations:
+        record_failure(
+            logger,
+            metrics,
+            event="recommendation_identity_unreadable",
+            code="recommendation_id_error",
+            detail={
+                "considered": len(recommendations),
+                "rec_type": type(recommendations[0]).__name__,
+            },
+        )
     if match is None:
         raise api_error(
             404,
@@ -702,23 +812,62 @@ async def submit_recommendation(
     payload = to_jsonable(rec) or {}
     payload = payload if isinstance(payload, dict) else {}
 
-    tick = _snapshot_tick(snapshot)
-    quantity = body.quantity_liters or payload.get("quantity_liters") or 0.0
+    # Quantity is resolved with `is not None`, never with truthiness. Under
+    # truthiness an explicit `quantity_liters: 0` is falsy, so it silently fell
+    # through to the recommendation's own size — the operator was handed an
+    # allocation at a quantity they had deliberately not chosen. `0.0 in
+    # (None, "")` is also False, so the completeness check below could never
+    # catch a zero either, and `float(None)` on a recommendation carrying no
+    # quantity raised a TypeError into a 500.
+    quantity = (
+        body.quantity_liters
+        if body.quantity_liters is not None
+        else payload.get("quantity_liters")
+    )
+    if body.quantity_liters is not None and not body.quantity_liters > 0:
+        raise api_error(
+            400,
+            "invalid_quantity",
+            "quantity_liters must be greater than zero",
+            details={"quantity_liters": body.quantity_liters},
+        )
+
     # A2's `AllocationRequest.idempotency_key` is required by the simulator, so
-    # one is always sent. When the operator does not supply one it is derived
-    # from the recommendation id and the tick: a network-level retry inside the
-    # same tick therefore de-duplicates, while a later tick is a genuinely new
-    # decision and legitimately produces a new allocation.
-    idempotency_key = body.idempotency_key or f"{rec_id}-t{tick if tick is not None else 0}"
+    # one is always sent when the operator does not supply their own.
+    #
+    # It is derived from the *content* of the allocation, not from the tick.
+    # Guide section 5.4 makes a used key permanently occupied on the simulator,
+    # and that outlives this process — so a tick-derived key was wrong twice
+    # over: after a backend restart the same recommendation at the same tick
+    # replayed an allocation from the previous run, and a deliberate second
+    # submission within one tick (the operator overriding the size) was
+    # silently swallowed and answered with the first allocation.
+    #
+    # Content-addressing keeps the property that actually matters — an
+    # identical retry of an identical decision is de-duplicated — and drops the
+    # two that did not. An operator who genuinely wants to dispatch the same
+    # recommendation twice passes their own key, which is what the field is for.
+    idempotency_key = body.idempotency_key or _derive_idempotency_key(
+        rec_id,
+        depot_id=payload.get("depot_id"),
+        station_id=payload.get("station_id"),
+        route_id=payload.get("route_id"),
+        fuel_type=payload.get("fuel_type"),
+        quantity=quantity,
+    )
     request_payload = {
         "idempotency_key": idempotency_key,
         "source_depot_id": payload.get("depot_id"),
         "destination_station_id": payload.get("station_id"),
         "route_id": payload.get("route_id"),
         "fuel_type": payload.get("fuel_type"),
-        "quantity": float(quantity),
+        "quantity": float(quantity) if quantity is not None else None,
     }
-    missing = sorted(key for key, value in request_payload.items() if value in (None, ""))
+    missing = sorted(
+        key
+        for key, value in request_payload.items()
+        if value in (None, "") or (key == "quantity" and not value > 0)
+    )
     if missing:
         raise api_error(
             409,

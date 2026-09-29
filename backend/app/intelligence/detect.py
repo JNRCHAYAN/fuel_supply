@@ -185,6 +185,45 @@ def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _event_filter_match(parameters: Mapping[str, Any], key: str, entity_id: str) -> bool:
+    """Does a domain event's filter list cover ``entity_id``?
+
+    Integration guide section 7.8 pins the filter parameters as plural **lists**
+    -- ``region_ids``, ``station_ids``, ``route_ids``, ``depot_ids``,
+    ``fuel_types`` -- and states the matching rule outright: "if the list is
+    empty, the event applies to all entities of that type". An empty list
+    therefore means *every* entity, never *no* entity.
+
+    This call site used to read a singular ``region_id`` scalar, which a real
+    event never carries, so it could not match anything. The mismatch was
+    silent -- ``_mapping`` and ``.get`` are both defensive, so nothing raised --
+    and the consequence was not cosmetic: ``active_event_ids`` was always empty
+    for every region, ``affected`` was undercounted, and a genuine
+    ``regional_disruption`` could be suppressed at its
+    ``regional_min_entities`` threshold. The detector reported calm during a
+    crisis.
+
+    The singular spelling stays accepted as a fallback because fixtures and
+    older payloads carry it, but the documented plural list is authoritative.
+    """
+    values = parameters.get(key)
+    if values is None:
+        # Legacy singular spelling: `region_ids` -> `region_id`.
+        values = parameters.get(key[:-1])
+    if values is None or values == "":
+        # Absent (or blank) filter: the guide's "applies to all of that type".
+        return True
+    if isinstance(values, (str, bytes)):
+        # A bare scalar where a list is documented still means that one entity.
+        return str(values) == entity_id
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        # An unexpected shape is not evidence of a match; stay conservative.
+        return False
+    if not values:
+        return True
+    return any(str(value) == entity_id for value in values)
+
+
 def _ramp(value: Any, low: float, high: float) -> float:
     """Monotone 0 -> 1 as ``value`` rises from ``low`` to ``high``."""
     number = _finite(value)
@@ -860,7 +899,7 @@ class AnomalyDetector:
                 if str(_g(event, "status", "") or "").upper() != "ACTIVE":
                     continue
                 parameters = _mapping(_g(event, "parameters", {}))
-                if str(parameters.get("region_id", "")) == region_id:
+                if _event_filter_match(parameters, "region_ids", region_id):
                     active_events.append(str(_g(event, "id", "")))
             active_events.sort()
 

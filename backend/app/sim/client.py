@@ -102,10 +102,31 @@ _STREAM_MAX_DELAY = 30.0
 
 _BREAKER_COMPONENT = "simulator"
 
+#: The simulator's stale-data signal. Guide sections 3, 6.4 and 7.10: while a
+#: ``stale_data`` fault is active every non-stream ``/v1/*`` GET carries this
+#: response header with the value ``true``. The SSE stream deliberately does
+#: not, so only the REST read path below has to honour it.
+_STALE_HEADER = "X-Simulator-Stale"
+
 
 def _setting(settings: Any, name: str, default: Any) -> Any:
     value = getattr(settings, name, default)
     return default if value is None else value
+
+
+def _is_simulator_stale(response: httpx.Response) -> bool:
+    """Did the simulator flag this response as stale?
+
+    Lookup goes through ``httpx.Headers``, which folds header names
+    case-insensitively, so the wire casing (HTTP/1.1 servers commonly send
+    ``x-simulator-stale``) cannot hide the flag. An absent header and any value
+    that is not true-looking both mean "not stale" -- the conservative reading,
+    because the normal path is only ever overridden by an explicit ``true``.
+    """
+    raw = response.headers.get(_STALE_HEADER)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"true", "1"}
 
 
 def _as_model_list(model: type, payload: Any, *, endpoint: str) -> list[Any]:
@@ -420,14 +441,25 @@ class SimulatorClient:
         return value
 
     async def get_demand_history(
-        self, station_id: str | None = None, limit: int = 500
+        self, station_id: str | None = None, limit: int = 200
     ) -> list[DemandObservation]:
-        params: dict[str, Any] = {"limit": int(limit)}
+        """``GET /v1/demand-history``.
+
+        Guide 4.11: ``limit`` is clamped to ``[1, 2000]`` and defaults to 200.
+        The clamp is applied here as well as server-side, so a caller passing a
+        nonsense limit gets a defined page instead of the simulator's 422 -- and
+        because the cache key carries the *clamped* value, two spellings of the
+        same query share one entry rather than caching the same page twice.
+        Callers that pass an explicit in-range limit (the ingestor and the
+        intelligence layer pass 1500) are forwarded unchanged.
+        """
+        limit = max(1, min(2000, int(limit)))
+        params: dict[str, Any] = {"limit": limit}
         if station_id is not None:
             params["station_id"] = station_id
         # The cache key carries the query: a cached page must never answer a
         # different question.
-        key = f"demand-history:{station_id or '*'}:{int(limit)}"
+        key = f"demand-history:{station_id or '*'}:{limit}"
         value, _, _ = await self._read(
             key,
             "/v1/demand-history",
@@ -499,6 +531,18 @@ class SimulatorClient:
             "admin-pause", "POST", "/admin/pause", SimInstance.from_api
         )
 
+    async def admin_toggle(self) -> SimInstance:
+        """``POST /admin/toggle`` (guide 7.4) -- flip RUNNING <-> PAUSED.
+
+        A convenience for UIs, so it takes no request body and answers with the
+        instance in its new state, exactly like :meth:`admin_run` and
+        :meth:`admin_pause`. ``/admin/*`` paths stay unprefixed -- they bypass
+        fault injection and are not under ``/v1``.
+        """
+        return await self._write(
+            "admin-toggle", "POST", "/admin/toggle", SimInstance.from_api
+        )
+
     async def admin_step(self) -> dict[str, Any]:
         return await self._write(
             "admin-step",
@@ -547,20 +591,35 @@ class SimulatorClient:
         )
         return value
 
+    async def admin_get_events(self) -> list[DomainEvent]:
+        """``GET /admin/events`` (guide 7.13) -- last 50 injected events, id-desc.
+
+        The read-side twin of :meth:`admin_inject_event`. It shares the path with
+        the injector but a different method and cache key, and ``/admin/*``
+        bypasses fault injection, so a response here never carries the
+        ``X-Simulator-Stale`` signal.
+        """
+        value, _, _ = await self._read(
+            "admin-events", "/admin/events", self._list_parser(DomainEvent)
+        )
+        return value
+
     # ------------------------------------------------------------------ #
     # Snapshot assembly (the one place staleness is expressed)
     # ------------------------------------------------------------------ #
 
     async def build_snapshot(self) -> Snapshot:
-        """Assemble a ``Snapshot``, marked stale when it came from the cache.
+        """Assemble a ``Snapshot``, marked stale when any part is not current.
 
         ``Snapshot`` is the only type in the contract with ``stale`` and
         ``age_seconds`` fields, so this is where "last good answer, not a fresh
-        one" is recorded. If the breaker is open the per-endpoint reads serve
-        their own cached values and the assembled snapshot is marked stale with
-        the age of its *oldest* component; if some part has no cached value at
-        all, we fall back to the previous whole snapshot rather than mixing
-        fresh and stale halves into something that looks complete.
+        one" is recorded. A component read is stale either because the breaker
+        served its cache or because the simulator flagged the body
+        ``X-Simulator-Stale`` (see :meth:`_read`); either way the assembled
+        snapshot is marked stale with the age of its *oldest* component. If some
+        part has no cached value at all, we fall back to the previous whole
+        snapshot rather than mixing fresh and stale halves into something that
+        looks complete. A stale snapshot is not itself cached.
         """
         try:
             parts = await asyncio.gather(
@@ -778,13 +837,24 @@ class SimulatorClient:
         Returns ``(value, stale, age_seconds)``. The public ``get_*`` methods
         drop the last two; ``build_snapshot`` uses them to mark staleness.
 
+        ``stale`` means "this value must not be trusted as current". There are
+        two ways a read earns it:
+
+        * the breaker refused the call and a last-good value was served
+          (:meth:`_serve_last_good`) -- the simulator was not reached; or
+        * the simulator *did* answer, but flagged the body ``X-Simulator-Stale``
+          because a ``stale_data`` fault is active (guide 6.4/7.10) -- the
+          number is on the wire, it just is not current.
+
+        Both cases leave the value out of the caches, so anything reported stale
+        is reported stale on the way in as well as the way out.
+
         Two guards stand in front of the network, and they answer different
         problems:
 
         * **The memo.** A value read less than :attr:`memo_seconds` ago is
-          reused. It is *aged*, not *degraded* -- the simulator did answer,
-          moments ago -- so it is reported ``stale=False`` carrying its true
-          age. ``stale`` keeps its meaning: "the simulator did not answer".
+          reused, carrying its true age. Only values the simulator stood behind
+          are ever stored (see :meth:`_attempt`), so a memo hit is never stale.
         * **Coalescing**, in :meth:`_coalesced_read`. Callers arriving while a
           fetch for the same key is in flight await that fetch. This is what
           stops N concurrent operators becoming N simulator requests.
@@ -895,9 +965,15 @@ class SimulatorClient:
         The caller has already been authorised by ``allow()``. Asking again
         here would be refused under HALF_OPEN, where the first call claims the
         single trial and the second finds it already in flight.
+
+        A 2xx is cached as last-good *unless* the simulator flagged the body
+        stale, in which case the value is returned ``stale=True`` and written
+        nowhere -- see :meth:`_read` for why both halves matter.
         """
         try:
-            payload = await self._send_with_retry("GET", path, params=params)
+            payload, simulator_stale = await self._send_with_retry(
+                "GET", path, params=params
+            )
             value = self._parse(key, parser, payload, path)
         except SimulatorError as exc:
             self._record_failure(exc, url=path)
@@ -905,6 +981,23 @@ class SimulatorClient:
 
         self._breaker.record_success()
         self._emit_breaker_state()
+
+        if simulator_stale:
+            # The simulator answered, and told us the body must not be trusted
+            # as current. Recording success with the breaker is still right --
+            # the service is demonstrably up -- but nothing may be cached: a
+            # value the simulator itself has disowned can neither be memoised
+            # as fresh nor come back later as "last good", which build_snapshot
+            # would relabel as merely aged.
+            logger.warning(
+                "simulator flagged %r as stale (%s); not caching",
+                key,
+                _STALE_HEADER,
+                extra={"event": "sim.stale_response", "cache_key": key},
+            )
+            self._metric("record_sim_stale_read", key, 0.0)
+            return value, True, 0.0
+
         self._last_good[key] = (value, self._clock())
         return value, False, 0.0
 
@@ -932,7 +1025,7 @@ class SimulatorClient:
             )
 
         try:
-            payload = await self._send_with_retry(
+            payload, _ = await self._send_with_retry(
                 method, path, params=params, json_body=json_body
             )
             value = self._parse(key, parser, payload, path)
@@ -951,13 +1044,18 @@ class SimulatorClient:
         *,
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
-    ) -> Any:
-        """Perform one request with bounded retries. Raises ``SimulatorError``.
+    ) -> tuple[Any, bool]:
+        """Perform one request with bounded retries.
+
+        Returns ``(payload, stale)``, where ``stale`` is the simulator's own
+        ``X-Simulator-Stale`` signal for the 2xx that won. Raises
+        ``SimulatorError``.
 
         Retry policy (CONTRACT.md 5.5): 5xx and transport errors only, with
         exponential backoff. A 4xx is raised on the first response -- it is our
         request that is wrong, and repeating it would burn the timeout budget to
-        get the same rejection.
+        get the same rejection. A non-transport ``httpx.HTTPError`` is marked
+        ``retryable=False`` and so is raised on the spot for the same reason.
 
         Any 2xx is success. This matters for ``POST /v1/allocations``, which the
         guide documents as 200 and the live simulator answers 201 on an
@@ -978,23 +1076,29 @@ class SimulatorClient:
                     f"{type(exc).__name__}: {exc}", method=method, url=url
                 )
             except httpx.HTTPError as exc:
-                last_error = SimulatorError(
+                # A non-transport HTTPError (a redirect loop, a stream or
+                # decode failure) is non-retryable by construction, so it must
+                # be raised here. Falling through would spend the whole attempt
+                # budget repeating an error that repetition cannot fix.
+                raise SimulatorError(
                     f"{type(exc).__name__}: {exc}",
                     kind="transport",
                     method=method,
                     url=url,
                     retryable=False,
-                )
+                ) from exc
             else:
                 if 200 <= response.status_code < 300:
                     try:
-                        return self._decode(response, method=method, url=url)
+                        payload = self._decode(response, method=method, url=url)
                     except SimulatorError as exc:
                         # A 2xx whose body is not JSON is the simulator
                         # misbehaving, not our request being rejected, so it is
                         # retried on the same footing as a 5xx. (A 4xx is not:
                         # see the raise below.)
                         last_error = exc
+                    else:
+                        return payload, _is_simulator_stale(response)
                 else:
                     last_error = SimulatorError.from_body(
                         response.status_code,

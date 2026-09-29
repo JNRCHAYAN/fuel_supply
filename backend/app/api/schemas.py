@@ -175,7 +175,19 @@ def _as_dict_list(items: Any) -> list[dict[str, Any]]:
 #
 # A2 owns SimulatorError. Importing it eagerly would make this module (and so
 # every route) unimportable until A2 lands, so the class is matched by name and
-# by shape. That is deliberate: see the workstream report.
+# by shape -- `status_code`, `code`, `message`, `kind` are read defensively with
+# getattr, and none of them is imported. That is deliberate: see the workstream
+# report.
+
+#: A failure whose *only* honest reading is "the simulator is not answering".
+#: These names are A2's local breaker/unavailable errors; they carry no status
+#: code because no response ever arrived.
+_SIMULATOR_UNAVAILABLE_NAMES = frozenset({"CircuitOpenError", "SimulatorUnavailable"})
+
+#: `SimulatorError.kind` values that mean we never got a usable response
+#: (app/sim/errors.py): connection refused/DNS/timeout, an undecodable 2xx body,
+#: and a tripped breaker with no last-good value. Retryable by construction.
+_UNAVAILABLE_KINDS = frozenset({"transport", "decode", "circuit_open"})
 
 
 def is_simulator_error(exc: BaseException) -> bool:
@@ -184,13 +196,52 @@ def is_simulator_error(exc: BaseException) -> bool:
     return exc.__class__.__module__.startswith("app.sim")
 
 
+def _is_simulator_unavailable(exc: BaseException) -> bool:
+    """True when the simulator (not our request) is at fault.
+
+    A 5xx is the simulator failing to serve us; a transport/decode failure, a
+    tripped breaker or an explicit breaker/unavailable class means we never got
+    a usable answer at all. All of those are the back-off-and-retry case.
+    """
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 500:
+        return True
+    if type(exc).__name__ in _SIMULATOR_UNAVAILABLE_NAMES:
+        return True
+    return getattr(exc, "kind", None) in _UNAVAILABLE_KINDS
+
+
 def simulator_error_to_http(exc: BaseException) -> HTTPException:
-    """Normalise any simulator-side failure into a typed 502."""
+    """Map a simulator failure onto the HTTP status the *caller* must branch on.
+
+    Guide section 9 is a per-code table, not one status: a rejected allocation is
+    its own 404/409/422 and only ``503 FAULT_INJECTED`` (plus a transport fault,
+    which is the same condition seen from this side) is the back-off case.
+    Section 10 bullet 11 pins ``POST /v1/allocations`` to ``201/200/404/409/503``.
+
+    This used to collapse *every* simulator error to 502, which destroyed that
+    distinction: a 409 ``INSUFFICIENT_INVENTORY`` or ``IDEMPOTENCY_KEY_MISMATCH``
+    reached the operator as "upstream is broken, try again", actively inviting a
+    re-POST of the very allocation the simulator had just refused. So:
+
+    * a 4xx the simulator chose (``SimulatorError.status_code``) is preserved --
+      our request was wrong and the ``code`` in the body says which way;
+    * a 5xx, a transport fault or a tripped breaker is 503, the
+      back-off-and-retry case;
+    * anything we cannot classify at all stays 502.
+
+    The machine-readable ``code`` is carried in the body in every case: it, not
+    the status, is what callers branch on.
+    """
     code = getattr(exc, "code", None) or "simulator_error"
     message = getattr(exc, "message", None) or str(exc) or type(exc).__name__
-    status = 502
-    if type(exc).__name__ in {"CircuitOpenError", "SimulatorUnavailable"}:
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and 400 <= status_code < 500:
+        status = status_code
+    elif _is_simulator_unavailable(exc):
         status = 503
+    else:
+        status = 502
     return api_error(status, str(code), str(message), details={"source": "simulator"})
 
 
@@ -228,8 +279,10 @@ async def simulator_guard(
     *,
     metrics: Any | None = None,
 ) -> Any:
-    """Await a simulator call, converting any failure into a typed 502/503.
+    """Await a simulator call, converting any failure into a typed status.
 
+    The status is the simulator's own when it rejected the request (4xx) and a
+    503 when the simulator is unavailable; see `simulator_error_to_http`.
     CONTRACT.md section 0.4 and the "a simulator failure is a typed error, not a
     stack trace" requirement. Cancellation is deliberately *not* swallowed:
     `asyncio.CancelledError` derives from BaseException.
@@ -749,7 +802,9 @@ class SubmitRequest(BaseModel):
         strict=True,
         description="Explicit operator acknowledgement. Must be the boolean true; anything else is a 400.",
     )
-    idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
+    #: Guide section 5.1: `idempotency_key` is 1-150 characters on the wire.
+    #: A longer key is a 422 from the simulator, so it is rejected here instead.
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=150)
     quantity_liters: float | None = Field(default=None, gt=0)
     note: str | None = Field(default=None, max_length=1000)
     model_config = _ALLOW_EXTRA

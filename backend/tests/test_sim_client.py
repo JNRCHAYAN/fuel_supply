@@ -449,10 +449,50 @@ async def test_422_is_not_retried():
         sleep=RecordingSleep(),
     )
     with pytest.raises(SimulatorError) as caught:
-        await client.get_demand_history(limit=-1)
+        await client.get_health()
     assert counter.count == 1
     assert caught.value.kind == "validation"
     assert caught.value.code == "VALIDATION_ERROR"
+    await client.aclose()
+
+
+async def test_demand_history_limit_defaults_to_200_and_is_clamped():
+    """Guide 4.11: ``limit`` is clamped to ``[1, 2000]`` and defaults to 200.
+
+    The clamp is applied client-side, so a nonsense limit buys a defined page
+    rather than the simulator's 422 -- the old behaviour forwarded ``-1`` and
+    encoded the rejection. An explicit in-range limit is forwarded untouched:
+    the ingestor and the intelligence layer both pass 1500.
+
+    ``ttl=0`` disables the memo, because ``-1`` and ``0`` clamp to the *same*
+    cache key and the second call would otherwise be a memo hit, not a request.
+    """
+    seen: list[httpx.URL] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        return httpx.Response(200, json=DEMAND_HISTORY)
+
+    client = SimulatorClient(
+        settings(simulator_cache_ttl_seconds=0),
+        None,
+        transport=httpx.MockTransport(handler),
+        clock=FakeClock(),
+        sleep=RecordingSleep(),
+    )
+    await client.get_demand_history()
+    await client.get_demand_history(limit=-1)
+    await client.get_demand_history(limit=0)
+    await client.get_demand_history(limit=99_999)
+    await client.get_demand_history(limit=1500)
+
+    assert [url.params["limit"] for url in seen] == [
+        "200",
+        "1",
+        "1",
+        "2000",
+        "1500",
+    ]
     await client.aclose()
 
 
@@ -539,6 +579,35 @@ async def test_transport_error_is_retried():
     assert caught.value.kind == "transport"
     assert caught.value.status_code is None
     assert caught.value.retryable is True
+    await client.aclose()
+
+
+async def test_a_non_transport_http_error_is_not_retried():
+    """A non-transport ``httpx.HTTPError`` is marked non-retryable, so it must raise.
+
+    ``httpx.DecodingError`` is an ``HTTPError`` but *not* a ``TransportError``,
+    so it lands in the branch that sets ``retryable=False``. That branch has to
+    raise on the spot: falling through would spend the whole attempt budget
+    repeating an error that repetition cannot fix, contradicting the module's
+    stated policy.
+    """
+    counter = CountingHandler(
+        handler_for({"/v1/health": httpx.DecodingError("bad framing")})
+    )
+    sleep = RecordingSleep()
+    client = SimulatorClient(
+        settings(simulator_max_retries=3),
+        None,
+        transport=httpx.MockTransport(counter),
+        clock=FakeClock(),
+        sleep=sleep,
+    )
+    with pytest.raises(SimulatorError) as caught:
+        await client.get_health()
+    assert counter.count == 1, "a non-retryable error must not be retried"
+    assert sleep.delays == [], "no backoff after an immediate raise"
+    assert caught.value.kind == "transport"
+    assert caught.value.retryable is False
     await client.aclose()
 
 
@@ -695,6 +764,7 @@ async def test_admin_writes_and_reads():
     routes = {
         "/admin/run": INSTANCE,
         "/admin/pause": {**INSTANCE, "status": "PAUSED"},
+        "/admin/toggle": {**INSTANCE, "status": "PAUSED"},
         "/admin/step": {"tick": 3889},
         "/admin/reset": {"status": "reset"},
         "/admin/events": EVENTS[0],
@@ -703,10 +773,11 @@ async def test_admin_writes_and_reads():
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        entry = routes[request.url.path]
         if request.url.path == "/admin/faults" and request.method == "GET":
             return httpx.Response(200, json=[FAULT])
-        return httpx.Response(200, json=entry)
+        if request.url.path == "/admin/events" and request.method == "GET":
+            return httpx.Response(200, json=[EVENTS[0]])
+        return httpx.Response(200, json=routes[request.url.path])
 
     client = SimulatorClient(
         settings(), None, transport=httpx.MockTransport(handler), clock=FakeClock(), sleep=RecordingSleep()
@@ -714,12 +785,16 @@ async def test_admin_writes_and_reads():
 
     assert (await client.admin_run()).is_running is True
     assert (await client.admin_pause()).status == "PAUSED"
+    assert (await client.admin_toggle()).status == "PAUSED"
     assert (await client.admin_step())["tick"] == 3889
     assert (await client.admin_reset())["status"] == "reset"
     assert (await client.admin_inject_event(EventRequest("demand_spike", 10, 5))).id == 1
     assert (await client.admin_inject_fault(FaultRequest("latency", 1))).type == "latency"
     assert (await client.admin_clear_faults())["status"] == "cleared"
     assert (await client.admin_get_faults())[0].active is True
+    # Guide 7.13: the read side of /admin/events returns a list, unlike the
+    # single-event injector that shares the path.
+    assert (await client.admin_get_events())[0].id == 1
     await client.aclose()
 
 

@@ -30,6 +30,8 @@ CONTRACT_ROUTES: set[tuple[str, str]] = {
     ("GET", "/api/v1/recommendations"),
     ("GET", "/api/v1/recommendations/{id}/explanation"),
     ("POST", "/api/v1/recommendations/{id}/submit"),
+    ("GET", "/api/v1/allocations"),
+    ("POST", "/api/v1/allocations/{id}/cancel"),
     ("GET", "/api/v1/decisions"),
     ("GET", "/api/v1/decisions/{id}"),
     ("GET", "/api/v1/events"),
@@ -38,12 +40,17 @@ CONTRACT_ROUTES: set[tuple[str, str]] = {
     ("GET", "/api/v1/admin/faults"),
     ("POST", "/api/v1/admin/faults"),
     ("POST", "/api/v1/admin/simulation/{action}"),
+    # Exposed by the network workstream from the simulator's own sub-resource
+    # reads (guide sections 4.5/4.6). They are in the router, so they belong in
+    # this table; it is the guard against a route appearing undeclared.
+    ("GET", "/api/v1/depots/{entity_id}"),
+    ("GET", "/api/v1/stations/{entity_id}"),
 }
 
 
 def _normalise(path: str) -> str:
-    """`{rec_id}` and `{decision_id}` are the contract's `{id}`."""
-    for placeholder in ("{rec_id}", "{decision_id}"):
+    """`{rec_id}`, `{decision_id}` and `{allocation_id}` are the contract's `{id}`."""
+    for placeholder in ("{rec_id}", "{decision_id}", "{allocation_id}"):
         path = path.replace(placeholder, "{id}")
     return path
 
@@ -54,6 +61,7 @@ def _concrete_to_template(path: str) -> str:
         re.sub(r"/recommendations/[^/]+/", "/recommendations/{id}/", path)
         .replace("/decisions/1", "/decisions/{id}")
         .replace("/simulation/step", "/simulation/{action}")
+        .replace("/allocations/700/cancel", "/allocations/{id}/cancel")
     )
 
 
@@ -123,11 +131,17 @@ def test_no_path_is_registered_twice() -> None:
     assert not duplicates, f"duplicate routes in the assembled app: {sorted(duplicates)}"
 
 
-def test_submit_is_the_only_write_to_the_simulator() -> None:
-    """Brief section 24: one explicit operator-initiated write path."""
+def test_submit_and_cancel_are_the_only_allocation_write_paths() -> None:
+    """Brief section 24: the only operator-initiated writes to the simulator.
+
+    `POST /api/v1/admin/faults` is demo control, not an allocation. Creating an
+    allocation (`submit`) and cancelling one (`cancel`) are the two deliberate
+    human-reviewed writes; both require `{"confirm": true}`.
+    """
     routes = {r.path for r in api_router.routes}
     assert "/api/v1/admin/faults" in routes  # demo control, not an allocation
     assert "/api/v1/recommendations/{rec_id}/submit" in routes
+    assert "/api/v1/allocations/{allocation_id}/cancel" in routes
 
 
 def test_response_models_are_declared_for_the_data_routes() -> None:
@@ -163,6 +177,8 @@ _ALL_ROUTE_CALLS: tuple[tuple[str, str, dict | None], ...] = (
     ("GET", "/api/v1/recommendations", None),
     ("GET", "/api/v1/recommendations/rec-1/explanation", None),
     ("POST", "/api/v1/recommendations/rec-1/submit", {"confirm": True}),
+    ("GET", "/api/v1/allocations", None),
+    ("POST", "/api/v1/allocations/700/cancel", {"confirm": True}),
     ("GET", "/api/v1/decisions", None),
     ("GET", "/api/v1/decisions/1", None),
     ("GET", "/api/v1/events", None),
@@ -203,7 +219,9 @@ def test_every_route_including_the_error_paths_leaks_no_secret() -> None:
         "get_metrics",
         "get_health",
         "get_demand_history",
+        "get_allocations",
         "create_allocation",
+        "cancel_allocation",
         "admin_get_faults",
         "admin_inject_fault",
         "admin_step",

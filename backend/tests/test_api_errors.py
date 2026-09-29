@@ -194,7 +194,45 @@ def test_a_simulator_failure_on_events_is_typed() -> None:
     assert error_code(response) == "simulator_error"
 
 
-def test_a_simulator_failure_during_submission_is_typed() -> None:
+def test_a_rejected_submission_keeps_the_simulators_own_status() -> None:
+    """A 4xx from the simulator is *our* request being refused, not an upstream
+    outage. It must reach the operator as its own status: flattening it to 502
+    said "retry" about the very allocation the simulator had just rejected
+    (guide section 9; POST /v1/allocations is 201/200/404/409/503).
+
+    The exception is the simulator's real shape, built from the live 409
+    ROUTE_MISMATCH envelope::
+
+        {"detail": {"code": "ROUTE_MISMATCH", "message": "Route does not connect ..."}}
+    """
+    from app.sim.errors import SimulatorError
+
+    class RejectingClient(FakeSimulatorClient):
+        async def create_allocation(self, req):
+            raise SimulatorError.from_body(
+                409,
+                {
+                    "detail": {
+                        "code": "ROUTE_MISMATCH",
+                        "message": "Route does not connect selected depot and station",
+                    }
+                },
+                method="POST",
+                url="/v1/allocations",
+            )
+
+    broken = RejectingClient()
+    response = client(build_app(client=broken)).post(
+        f"/api/v1/recommendations/{SUBJECT}/submit", json={"confirm": True}
+    )
+    assert response.status_code == 409
+    assert error_code(response) == "ROUTE_MISMATCH"
+    assert broken.allocations == []
+
+
+def test_an_unclassifiable_simulator_failure_during_submission_is_typed() -> None:
+    """A failure with no status code and no envelope cannot be blamed on the
+    request, so it stays a typed 502 -- never a 500 and never a 4xx."""
     broken = FakeSimulatorClient()
     broken.fail_on = {"create_allocation"}
     response = client(build_app(client=broken)).post(

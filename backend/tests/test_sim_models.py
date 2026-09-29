@@ -116,7 +116,8 @@ DOMAIN_EVENT = {
     "start_tick": 500,
     "end_tick": 520,
     "status": "RESOLVED",
-    "parameters": {"region_id": "region-dhaka", "factor": 1.5},
+    # Guide 4.9 / 7.8: the filters are plural lists, the scalar is a multiplier.
+    "parameters": {"region_ids": ["region-dhaka"], "multiplier": 1.5},
 }
 
 ALLOCATION = {
@@ -204,6 +205,32 @@ def test_metrics():
     assert metrics.allocation_failures == 0
 
 
+def test_a_null_service_level_is_unknown_not_zero() -> None:
+    """Guide 4.12: 1.0 means zero unmet demand, so 0.0 is a real measurement.
+
+    A missing field therefore means "not reported", which must stay distinct
+    from a measured total failure rather than being coerced to 0.0.
+    """
+    for payload in (
+        {**METRICS, "service_level": None},
+        {k: v for k, v in METRICS.items() if k != "service_level"},
+    ):
+        metrics = Metrics.from_api(payload)
+        assert metrics.service_level is None
+        assert metrics.service_level != 0.0
+        # The rest of the block still parsed.
+        assert metrics.unmet_demand_liters == 3680414.477
+
+    # A genuine zero is still a zero.
+    assert Metrics.from_api({**METRICS, "service_level": 0.0}).service_level == 0.0
+
+
+def test_a_non_numeric_service_level_is_still_an_error() -> None:
+    """Tolerating null must not turn a malformed reading into a silent one."""
+    with pytest.raises(ValueError, match="service_level"):
+        Metrics.from_api({**METRICS, "service_level": "excellent"})
+
+
 def test_region():
     region = Region.from_api(REGION)
     assert (region.id, region.name, region.demand_factor) == (
@@ -273,7 +300,7 @@ def test_domain_event():
     assert event.start_tick == 500
     assert event.end_tick == 520
     assert event.status == "RESOLVED"
-    assert event.parameters == {"region_id": "region-dhaka", "factor": 1.5}
+    assert event.parameters == {"region_ids": ["region-dhaka"], "multiplier": 1.5}
     assert event.is_active is False
 
 
